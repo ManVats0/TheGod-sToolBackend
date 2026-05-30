@@ -123,7 +123,7 @@ app.post('/api/forgot-password', async (req, res) => {
 
     await User.updateOne({ email }, { $set: { resetToken, resetTokenExpiry } })
 
-    const resetLink = `http://localhost:5173/reset-password?token=${resetToken}`
+    const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`
 
     const nodemailer = require('nodemailer')
     const transporter = nodemailer.createTransport({
@@ -263,20 +263,30 @@ app.post('/api/ai-usage', async (req, res) => {
   if (user.plan === 'solo') {
     return res.status(403).json({ error: 'no_plan', message: 'AI not included in Solo plan. Upgrade to Starter or Pro.' })
   }
-  if (user.plan === 'starter') {
-    const usageDate = user.aiUsageDate
-    const usageCount = usageDate === today ? (user.aiUsageToday || 0) : 0
-    if (usageCount >= 50) {
-      return res.status(429).json({ error: 'limit_reached', message: 'Daily AI limit reached (50/day). Upgrade to Pro for unlimited.' })
-    }
-    await User.updateOne(
-      { _id: decoded.userId },
-      { $set: { aiUsageDate: today, aiUsageToday: usageCount + 1 } }
-    )
-    return res.json({ allowed: true, usageToday: usageCount + 1, limit: 50 })
+  const AI_LIMITS: Record<string, number> = {
+    solo: 20,
+    starter: 500,
+    pro_monthly: 5000,
+    pro_yearly: 10000,
   }
-  // pro_monthly or pro_yearly — unlimited
-  return res.json({ allowed: true, usageToday: null, limit: null })
+
+  const limit = AI_LIMITS[user.plan]
+  if (!limit) {
+    return res.status(403).json({ error: 'no_plan', message: 'Upgrade to use AI features' })
+  }
+
+  const usageDate = user.aiUsageDate
+  const usageCount = usageDate === today ? (user.aiUsageToday || 0) : 0
+
+  if (usageCount >= limit) {
+    return res.status(429).json({ error: 'limit_reached', message: `Daily AI limit reached (${limit}/day). Upgrade your plan for more.` })
+  }
+
+  await User.updateOne(
+    { _id: decoded.userId },
+    { $set: { aiUsageDate: today, aiUsageToday: usageCount + 1 } }
+  )
+  return res.json({ allowed: true, usageToday: usageCount + 1, limit })
 })
 
 // ── Razorpay webhook (optional but recommended) ─────────────────────────────
