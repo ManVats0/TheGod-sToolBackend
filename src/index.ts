@@ -129,7 +129,7 @@ app.post('/api/forgot-password', async (req, res) => {
     const resend = new Resend(process.env.RESEND_API_KEY)
 
     await resend.emails.send({
-      from: "The Gods Tool <onboarding@resend.dev>",
+      from: "The Gods Tool <noreply@thegodstool.com>",
       to: email,
       subject: 'Password Reset Link',
       html: `
