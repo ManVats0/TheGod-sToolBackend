@@ -176,6 +176,41 @@ app.post('/api/reset-password', async (req, res) => {
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok' }))
 
+app.post('/api/save-alert-email', async (req, res) => {
+  try {
+    const { email } = req.body
+    if (!email) return res.status(400).json({ error: 'Email required' })
+
+    const { Resend } = require('resend')
+    const resend = new Resend(process.env.RESEND_API_KEY)
+
+    await resend.emails.send({
+      from: "The Gods Tool <noreply@thegodstool.com>",
+      to: email,
+      subject: 'Data Alerts Activated — The God\'s Tool',
+      html: `
+        <div style="font-family:Georgia,serif;background:#05080f;color:#e2e8f0;padding:32px;border-radius:8px;">
+          <h2 style="color:#a78bfa;">The God's Tool</h2>
+          <p>✅ Your email has been registered for data quality alerts.</p>
+          <p style="margin-top:12px;">You'll receive a notification here whenever your uploaded CSV triggers:</p>
+          <ul style="color:#94a3b8;margin-top:8px;line-height:1.8;">
+            <li>⚠️ Data Staleness</li>
+            <li>🔁 Schema Drift</li>
+            <li>📊 Anomalies / Imbalance</li>
+            <li>❌ Flow Failures</li>
+          </ul>
+          <p style="margin-top:24px;color:#475569;font-size:0.8rem;">If you didn't set this up, ignore this email.</p>
+        </div>
+      `
+    })
+
+    res.json({ success: true })
+  } catch (err) {
+    console.error('🔴 Save alert email error:', err)
+    res.status(500).json({ error: 'Failed to send confirmation email' })
+  }
+})
+
 // ── Plan info ───────────────────────────────────────────────────────────────
 app.get('/api/plan', async (req, res) => {
   const decoded = getUserFromToken(req)
