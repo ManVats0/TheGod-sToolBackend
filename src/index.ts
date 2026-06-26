@@ -25,19 +25,55 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET!
 })
 
-const PLAN_IDS: Record<string, string> = {
-  solo:        process.env.RAZORPAY_PLAN_SOLO!,
-  starter:     process.env.RAZORPAY_PLAN_STARTER!,
-  pro_monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY!,
-  pro_yearly:  process.env.RAZORPAY_PLAN_PRO_YEARLY!
+const PLAN_IDS: Record<string, { monthly: string; yearly: string }> = {
+  lite:       { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY! },
+  starter:    { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY!,    yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY! },
+  pro:        { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY!,        yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY! },
+  team:       { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY! },
+  enterprise: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY! }
+}
+
+// Max concurrent logged-in sessions allowed per plan ("User Limit" column)
+const PLAN_SESSION_LIMITS: Record<string, number> = {
+  none:       1,
+  lite:       1,
+  starter:    1,
+  pro:        5,
+  team:       15,
+  enterprise: 100
+}
+
+// Daily AI transform limits per plan
+const AI_LIMITS: Record<string, number> = {
+  lite:       4,
+  starter:    35,
+  pro:        110,
+  team:       150,
+  enterprise: 500
+}
+
+// Issues a session + JWT, enforcing the plan's concurrent-login limit
+async function issueSessionAndToken(user: any, device: string): Promise<{ token?: string; error?: string }> {
+  const limit = PLAN_SESSION_LIMITS[user.plan] || 1
+  const sessions = user.sessions || []
+  if (sessions.length >= limit) {
+    return { error: `Login limit reached for your plan (max ${limit} device${limit > 1 ? 's' : ''} signed in at once). Log out on another device or upgrade your plan.` }
+  }
+  const sessionId = crypto.randomUUID()
+  await User.updateOne(
+    { _id: user._id },
+    { $push: { sessions: { sessionId, device, createdAt: new Date(), lastActive: new Date() } } }
+  )
+  const token = jwt.sign({ userId: user._id, email: user.email, sessionId }, JWT_SECRET, { expiresIn: '7d' })
+  return { token }
 }
 
 // Helper: decode JWT from Authorization header
-function getUserFromToken(req: express.Request): { userId: string; email: string } | null {
+function getUserFromToken(req: express.Request): { userId: string; email: string; sessionId?: string } | null {
   const auth = req.headers.authorization
   if (!auth || !auth.startsWith('Bearer ')) return null
   try {
-    return jwt.verify(auth.slice(7), JWT_SECRET) as { userId: string; email: string }
+    return jwt.verify(auth.slice(7), JWT_SECRET) as { userId: string; email: string; sessionId?: string }
   } catch {
     return null
   }
@@ -56,7 +92,8 @@ app.post('/api/register', async (req, res) => {
     const hashed = await bcrypt.hash(password, 10)
     const user = await User.create({ email, password: hashed })
 
-    const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' })
+    const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
+    if (error) return res.status(429).json({ error })
     res.json({ token, email: user.email })
   } catch (err) {
     res.status(500).json({ error: 'Server error' })
@@ -77,7 +114,8 @@ app.post('/api/login', async (req, res) => {
     if (!match)
       return res.status(400).json({ error: 'Invalid credentials' })
 
-    const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' })
+    const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
+    if (error) return res.status(429).json({ error })
     res.json({ token, email: user.email })
   } catch (err) {
     res.status(500).json({ error: 'Server error' })
@@ -102,7 +140,8 @@ app.post('/api/google', async (req, res) => {
     if (!user)
       return res.status(500).json({ error: 'Failed to create or update user' })
 
-    const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' })
+    const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
+    if (error) return res.status(429).json({ error })
     res.json({ token, email: user.email })
   } catch (err) {
     console.error('🔴 Google route error:', err)
@@ -176,6 +215,17 @@ app.post('/api/reset-password', async (req, res) => {
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok' }))
 
+// ── Logout: frees up one concurrent-login slot ──────────────────────────────
+app.post('/api/logout', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  await User.updateOne(
+    { _id: decoded.userId },
+    { $pull: { sessions: { sessionId: decoded.sessionId } } }
+  )
+  res.json({ success: true })
+})
+
 app.post('/api/save-alert-email', async (req, res) => {
   try {
     const { email } = req.body
@@ -229,14 +279,16 @@ app.get('/api/plan', async (req, res) => {
 app.post('/api/subscribe', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const { planKey } = req.body
+  const { planKey, billingCycle } = req.body
   if (!PLAN_IDS[planKey]) return res.status(400).json({ error: 'Invalid plan' })
+  if (billingCycle !== 'monthly' && billingCycle !== 'yearly') return res.status(400).json({ error: 'Invalid billing cycle' })
+  const razorpayPlanId = PLAN_IDS[planKey][billingCycle]
   try {
     const subscription = await razorpay.subscriptions.create({
-      plan_id: PLAN_IDS[planKey],
+      plan_id: razorpayPlanId,
       customer_notify: 1,
       quantity: 1,
-      total_count: planKey.includes('yearly') ? 1 : 12
+      total_count: billingCycle === 'yearly' ? 1 : 12
     })
     res.json({ subscriptionId: subscription.id, key: process.env.RAZORPAY_KEY_ID })
   } catch (err: any) {
@@ -249,7 +301,7 @@ app.post('/api/subscribe', async (req, res) => {
 app.post('/api/verify-payment', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, planKey } = req.body
+  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, planKey, billingCycle } = req.body
   const body = razorpay_payment_id + '|' + razorpay_subscription_id
   const expectedSignature = crypto
     .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
@@ -260,16 +312,9 @@ app.post('/api/verify-payment', async (req, res) => {
   }
   // Calculate expiry
   const now = new Date()
-  let expiresAt: Date
-  if (planKey === 'solo') {
-    expiresAt = new Date(now.setMonth(now.getMonth() + 1))
-  } else if (planKey === 'starter') {
-    expiresAt = new Date(now.setFullYear(now.getFullYear() + 1))
-  } else if (planKey === 'pro_monthly') {
-    expiresAt = new Date(now.setMonth(now.getMonth() + 1))
-  } else {
-    expiresAt = new Date(now.setFullYear(now.getFullYear() + 1))
-  }
+  const expiresAt: Date = billingCycle === 'yearly'
+    ? new Date(now.setFullYear(now.getFullYear() + 1))
+    : new Date(now.setMonth(now.getMonth() + 1))
   await User.updateOne(
     { _id: decoded.userId },
     { $set: { plan: planKey, planExpiresAt: expiresAt, razorpaySubscriptionId: razorpay_subscription_id } }
@@ -285,19 +330,6 @@ app.post('/api/ai-usage', async (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' })
 
   const today = new Date().toISOString().slice(0, 10)
-
-  if (user.plan === 'none') {
-    return res.status(403).json({ error: 'no_plan', message: 'Upgrade to use AI features' })
-  }
-  if (user.plan === 'solo') {
-    return res.status(403).json({ error: 'no_plan', message: 'AI not included in Solo plan. Upgrade to Starter or Pro.' })
-  }
-  const AI_LIMITS: Record<string, number> = {
-    solo: 20,
-    starter: 500,
-    pro_monthly: 5000,
-    pro_yearly: 10000,
-  }
 
   const limit = AI_LIMITS[user.plan]
   if (!limit) {
