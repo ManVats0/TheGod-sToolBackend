@@ -361,5 +361,63 @@ app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (re
   res.json({ received: true })
 })
 
+// ── AppSumo Licensing: Webhook ──────────────────────────────────────────────
+app.post('/v2/webhooks', async (req, res) => {
+  const { license_key, event, tier, prev_license_key, test } = req.body
+  console.log('🟣 AppSumo webhook:', event, license_key)
+
+  if (!test) {
+    try {
+      const planByTier: Record<number, string> = { 1: 'starter', 2: 'pro', 3: 'team' }
+      const planKey = planByTier[tier] || 'starter'
+
+      switch (event) {
+        case 'purchase':
+          await User.findOneAndUpdate(
+            { appsumoLicenseKey: license_key },
+            { $set: { appsumoLicenseKey: license_key, appsumoStatus: 'inactive', plan: planKey } },
+            { upsert: true, setDefaultsOnInsert: true }
+          )
+          break
+        case 'activate':
+          await User.updateOne(
+            { appsumoLicenseKey: license_key },
+            { $set: { appsumoStatus: 'active', plan: planKey } }
+          )
+          break
+        case 'upgrade':
+        case 'downgrade':
+          await User.updateOne(
+            { appsumoLicenseKey: prev_license_key },
+            { $set: { appsumoLicenseKey: license_key, plan: planKey } }
+          )
+          break
+        case 'deactivate':
+          await User.updateOne(
+            { appsumoLicenseKey: license_key },
+            { $set: { appsumoStatus: 'deactivated' } }
+          )
+          break
+      }
+    } catch (err) {
+      console.error('🔴 AppSumo webhook error:', err)
+      // still return success below — don't let AppSumo retry-storm on a DB hiccup
+    }
+  }
+
+  res.status(200).json({ event, success: true })
+})
+
+// ── AppSumo Licensing: OAuth Redirect ───────────────────────────────────────
+app.get('/v2/redirect-url', (req, res) => {
+  const { code } = req.query
+  if (!code) {
+    // AppSumo's validation ping — no code, just confirm we're alive
+    return res.status(200).json({ success: true })
+  }
+  // Send the customer into your real signup/activation flow on the frontend
+  res.redirect(`${process.env.FRONTEND_URL}/appsumo-activate?code=${code}`)
+})
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`))
