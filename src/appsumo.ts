@@ -1,5 +1,5 @@
 const express = require('express');
-const crypto = require('crypto');
+const nodeCrypto = require('crypto');
 const router = express.Router();
 
 // You'll get the REAL api key after AppSumo approves your listing.
