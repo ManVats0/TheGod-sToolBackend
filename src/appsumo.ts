@@ -13,7 +13,7 @@ function verifySignature(req) {
   if (!signature || !timestamp) return false;
 
   const payload = timestamp + JSON.stringify(req.body);
-  const expected = crypto
+const expected = nodeCrypto
     .createHmac('sha256', APPSUMO_API_KEY)
     .update(payload)
     .digest('hex');
