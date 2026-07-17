@@ -7,6 +7,7 @@ import dotenv from 'dotenv'
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
 import User from './User'
+import { OAuth2Client } from 'google-auth-library'
 
 dotenv.config()
 
@@ -24,6 +25,12 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID!,
   key_secret: process.env.RAZORPAY_KEY_SECRET!
 })
+
+const googleOAuthClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID!,
+  process.env.GOOGLE_CLIENT_SECRET!,
+  process.env.GOOGLE_REDIRECT_URI!
+)
 
 const PLAN_IDS: Record<string, { monthly: string; yearly: string }> = {
   lite:       { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY! },
@@ -66,6 +73,14 @@ async function issueSessionAndToken(user: any, device: string): Promise<{ token?
   )
   const token = jwt.sign({ userId: user._id, email: user.email, sessionId }, JWT_SECRET, { expiresIn: '7d' })
   return { token }
+}
+
+// Evicts the session that's been inactive the longest, freeing one concurrent-login slot
+async function evictOldestSession(userId: string): Promise<void> {
+  const user = await User.findById(userId)
+  if (!user || !user.sessions || user.sessions.length === 0) return
+  const oldest = user.sessions.reduce((a: any, b: any) => (a.lastActive < b.lastActive ? a : b))
+  await User.updateOne({ _id: userId }, { $pull: { sessions: { sessionId: oldest.sessionId } } })
 }
 
 // Helper: decode JWT from Authorization header
@@ -114,6 +129,10 @@ app.post('/api/login', async (req, res) => {
     if (!match)
       return res.status(400).json({ error: 'Invalid credentials' })
 
+    if (req.body.forceLogout) {
+      await evictOldestSession(user._id)
+    }
+
     const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
     if (error) return res.status(429).json({ error })
     res.json({ token, email: user.email })
@@ -124,7 +143,7 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/google', async (req, res) => {
   try {
-    const { email, googleId, name } = req.body
+    const { email, googleId, name, forceLogout } = req.body
     console.log('🟢 Google login received:', { email, googleId, name })
     if (!email || !googleId)
       return res.status(400).json({ error: 'Missing Google data' })
@@ -140,12 +159,57 @@ app.post('/api/google', async (req, res) => {
     if (!user)
       return res.status(500).json({ error: 'Failed to create or update user' })
 
+    if (forceLogout) {
+      await evictOldestSession(user._id)
+    }
+
     const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
     if (error) return res.status(429).json({ error })
     res.json({ token, email: user.email })
   } catch (err) {
     console.error('🔴 Google route error:', err)
     res.status(500).json({ error: 'Server error' })
+  }
+})
+
+// ── Google OAuth Redirect Fallback (used when popup/FedCM fails) ───────────
+app.get('/api/google/callback', async (req, res) => {
+  try {
+    const { code } = req.query
+    if (!code || typeof code !== 'string') {
+      return res.redirect(`${process.env.FRONTEND_URL}/?googleError=missing_code`)
+    }
+
+    const { tokens } = await googleOAuthClient.getToken(code)
+    const idToken = tokens.id_token
+    if (!idToken) {
+      return res.redirect(`${process.env.FRONTEND_URL}/?googleError=no_id_token`)
+    }
+
+    const ticket = await googleOAuthClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID!
+    })
+    const payload = ticket.getPayload()
+    if (!payload?.email || !payload?.sub) {
+      return res.redirect(`${process.env.FRONTEND_URL}/?googleError=invalid_payload`)
+    }
+
+    const user = await User.findOneAndUpdate(
+      { email: payload.email },
+      { $set: { googleId: payload.sub, name: payload.name } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    )
+
+    const { token, error } = await issueSessionAndToken(user, (req.headers['user-agent'] as string) || 'Unknown device')
+    if (error) {
+      return res.redirect(`${process.env.FRONTEND_URL}/?googleError=${encodeURIComponent(error)}`)
+    }
+
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${token}&email=${encodeURIComponent(user.email)}`)
+  } catch (err) {
+    console.error('🔴 Google OAuth callback error:', err)
+    res.redirect(`${process.env.FRONTEND_URL}/?googleError=server_error`)
   }
 })
 
@@ -359,64 +423,6 @@ app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (re
   if (digest !== signature) return res.status(400).json({ error: 'Invalid signature' })
   // You can handle subscription cancellation/renewal here later
   res.json({ received: true })
-})
-
-// ── AppSumo Licensing: Webhook ──────────────────────────────────────────────
-app.post('/v2/webhooks', async (req, res) => {
-  const { license_key, event, tier, prev_license_key, test } = req.body
-  console.log('🟣 AppSumo webhook:', event, license_key)
-
-  if (!test) {
-    try {
-      const planByTier: Record<number, string> = { 1: 'starter', 2: 'pro', 3: 'team' }
-      const planKey = planByTier[tier] || 'starter'
-
-      switch (event) {
-        case 'purchase':
-          await User.findOneAndUpdate(
-            { appsumoLicenseKey: license_key },
-            { $set: { appsumoLicenseKey: license_key, appsumoStatus: 'inactive', plan: planKey } },
-            { upsert: true, setDefaultsOnInsert: true }
-          )
-          break
-        case 'activate':
-          await User.updateOne(
-            { appsumoLicenseKey: license_key },
-            { $set: { appsumoStatus: 'active', plan: planKey } }
-          )
-          break
-        case 'upgrade':
-        case 'downgrade':
-          await User.updateOne(
-            { appsumoLicenseKey: prev_license_key },
-            { $set: { appsumoLicenseKey: license_key, plan: planKey } }
-          )
-          break
-        case 'deactivate':
-          await User.updateOne(
-            { appsumoLicenseKey: license_key },
-            { $set: { appsumoStatus: 'deactivated' } }
-          )
-          break
-      }
-    } catch (err) {
-      console.error('🔴 AppSumo webhook error:', err)
-      // still return success below — don't let AppSumo retry-storm on a DB hiccup
-    }
-  }
-
-  res.status(200).json({ event, success: true })
-})
-
-// ── AppSumo Licensing: OAuth Redirect ───────────────────────────────────────
-app.get('/v2/redirect-url', (req, res) => {
-  const { code } = req.query
-  if (!code) {
-    // AppSumo's validation ping — no code, just confirm we're alive
-    return res.status(200).json({ success: true })
-  }
-  // Send the customer into your real signup/activation flow on the frontend
-  res.redirect(`${process.env.FRONTEND_URL}/appsumo-activate?code=${code}`)
 })
 
 const PORT = process.env.PORT || 4000
