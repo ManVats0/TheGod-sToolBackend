@@ -76,7 +76,7 @@ async function issueSessionAndToken(user: any, device: string): Promise<{ token?
 }
 
 // Evicts the session that's been inactive the longest, freeing one concurrent-login slot
-async function evictOldestSession(userId: string): Promise<void> {
+async function evictOldestSession(userId: any): Promise<void> {
   const user = await User.findById(userId)
   if (!user || !user.sessions || user.sessions.length === 0) return
   const oldest = user.sessions.reduce((a: any, b: any) => (a.lastActive < b.lastActive ? a : b))
