@@ -32,12 +32,27 @@ const googleOAuthClient = new OAuth2Client(
   process.env.GOOGLE_REDIRECT_URI!
 )
 
-const PLAN_IDS: Record<string, { monthly: string; yearly: string }> = {
-  lite:       { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY! },
-  starter:    { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY!,    yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY! },
-  pro:        { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY!,        yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY! },
-  team:       { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY! },
-  enterprise: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY! }
+const PLAN_IDS: Record<string, { INR: { monthly: string; yearly: string }; USD: { monthly: string; yearly: string } }> = {
+  lite: {
+    INR: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY! },
+    USD: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_USD!,   yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_USD! }
+  },
+  starter: {
+    INR: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY!,    yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY! },
+    USD: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_USD! }
+  },
+  pro: {
+    INR: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY!,        yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY! },
+    USD: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_USD!,    yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_USD! }
+  },
+  team: {
+    INR: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY! },
+    USD: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_USD!,   yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_USD! }
+  },
+  enterprise: {
+    INR: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY! },
+    USD: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_USD! }
+  }
 }
 
 // Max concurrent logged-in sessions allowed per plan ("User Limit" column)
@@ -343,10 +358,12 @@ app.get('/api/plan', async (req, res) => {
 app.post('/api/subscribe', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const { planKey, billingCycle } = req.body
+  const { planKey, billingCycle, currency } = req.body
   if (!PLAN_IDS[planKey]) return res.status(400).json({ error: 'Invalid plan' })
   if (billingCycle !== 'monthly' && billingCycle !== 'yearly') return res.status(400).json({ error: 'Invalid billing cycle' })
-  const razorpayPlanId = PLAN_IDS[planKey][billingCycle]
+  const selectedCurrency = currency === 'USD' ? 'USD' : 'INR'
+  const razorpayPlanId = PLAN_IDS[planKey][selectedCurrency][billingCycle]
+  if (!razorpayPlanId) return res.status(400).json({ error: 'Plan not available for this currency' })
   try {
     const subscription = await razorpay.subscriptions.create({
       plan_id: razorpayPlanId,
