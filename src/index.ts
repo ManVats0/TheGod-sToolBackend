@@ -350,7 +350,8 @@ app.get('/api/plan', async (req, res) => {
     plan: user.plan,
     planExpiresAt: user.planExpiresAt,
     aiUsageToday: user.aiUsageToday,
-    aiUsageDate: user.aiUsageDate
+    aiUsageDate: user.aiUsageDate,
+    name: user.name || null
   })
 })
 
