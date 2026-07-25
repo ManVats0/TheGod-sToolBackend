@@ -34,23 +34,23 @@ const googleOAuthClient = new OAuth2Client(
 
 const PLAN_IDS: Record<string, { INR: { monthly: string; yearly: string }; USD: { monthly: string; yearly: string } }> = {
   lite: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY! },
+    INR: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_INR!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_INR! },
     USD: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_USD!,   yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_USD! }
   },
   starter: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY!,    yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY! },
+    INR: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_INR!,    yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_INR! },
     USD: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_USD! }
   },
   pro: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY!,        yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY! },
+    INR: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_INR!,        yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_INR! },
     USD: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_USD!,    yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_USD! }
   },
   team: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY!,       yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY! },
+    INR: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_INR!,       yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_INR! },
     USD: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_USD!,   yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_USD! }
   },
   enterprise: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY! },
+    INR: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_INR!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_INR! },
     USD: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_USD! }
   }
 }
