@@ -58,6 +58,7 @@ const PLAN_IDS: Record<string, { INR: { monthly: string; yearly: string }; USD: 
 // Max concurrent logged-in sessions allowed per plan ("User Limit" column)
 const PLAN_SESSION_LIMITS: Record<string, number> = {
   none:       1,
+  trial:      1,
   lite:       1,
   starter:    1,
   pro:        5,
@@ -67,6 +68,7 @@ const PLAN_SESSION_LIMITS: Record<string, number> = {
 
 // Daily AI transform limits per plan
 const AI_LIMITS: Record<string, number> = {
+  trial:      15,
   lite:       4,
   starter:    35,
   pro:        110,
@@ -346,6 +348,15 @@ app.get('/api/plan', async (req, res) => {
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   const user = await User.findById(decoded.userId)
   if (!user) return res.status(404).json({ error: 'User not found' })
+
+  // Downgrade expired trials to 'none' before responding.
+  // Only touches users on 'trial' — never affects paid plans or existing 'none' users.
+  if (user.plan === 'trial' && user.planExpiresAt && user.planExpiresAt < new Date()) {
+    user.plan = 'none'
+    user.planExpiresAt = null
+    await user.save()
+  }
+
   res.json({
     plan: user.plan,
     planExpiresAt: user.planExpiresAt,
