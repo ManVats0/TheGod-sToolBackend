@@ -8,9 +8,10 @@ const userSchema = new mongoose.Schema({
   resetToken: { type: String, default: null },
   resetTokenExpiry: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
-  plan: { type: String, enum: ['none', 'lite', 'starter', 'pro', 'team', 'enterprise'], default: 'none' },
-  planExpiresAt: { type: Date, default: null },
+  plan: { type: String, enum: ['none', 'trial', 'lite', 'starter', 'pro', 'team', 'enterprise'], default: 'trial' },
+  planExpiresAt: { type: Date, default: () => new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) },
   razorpaySubscriptionId: { type: String, default: null },
+  hasUsedTrial: { type: Boolean, default: true },
   aiUsageToday: { type: Number, default: 0 },
   aiUsageDate: { type: String, default: null },
   sessions: {
