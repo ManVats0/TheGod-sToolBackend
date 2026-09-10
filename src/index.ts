@@ -415,6 +415,56 @@ app.post('/api/verify-payment', async (req, res) => {
   res.json({ success: true, plan: planKey })
 })
 
+// ── Create a one-time custom-amount payment order (NOT a subscription) ─────
+// User enters any amount; this creates a Razorpay Order for that exact
+// amount. No plan/backend activation happens here or in the verify route
+// below — this exists purely to confirm the money reaches your bank account.
+app.post('/api/create-custom-order', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const { amount, currency } = req.body
+  const amountNum = Number(amount)
+  if (!amountNum || amountNum <= 0) {
+    return res.status(400).json({ error: 'Enter a valid amount greater than 0' })
+  }
+  const selectedCurrency = currency === 'USD' ? 'USD' : 'INR'
+  try {
+    const order = await razorpay.orders.create({
+      amount: Math.round(amountNum * 100), // Razorpay wants the smallest unit (paise/cents)
+      currency: selectedCurrency,
+      receipt: `custom_${Date.now()}`,
+      payment_capture: true, // auto-capture so funds actually settle, not just authorize
+      notes: { userId: decoded.userId, type: 'custom_payment' }
+    })
+    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.RAZORPAY_KEY_ID })
+  } catch (err: any) {
+    console.error('🔴 Razorpay create-custom-order error:', err)
+    res.status(500).json({ error: 'Could not create payment order' })
+  }
+})
+
+// ── Verify the one-time custom payment ──────────────────────────────────────
+// Order signature formula differs from the Subscription one above:
+// HMAC_SHA256(order_id + "|" + payment_id, key_secret). No DB/plan changes —
+// this route only confirms the payment is genuine.
+app.post('/api/verify-custom-payment', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing payment fields' })
+  }
+  const body = razorpay_order_id + '|' + razorpay_payment_id
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
+    .update(body)
+    .digest('hex')
+  if (expectedSignature !== razorpay_signature) {
+    return res.status(400).json({ success: false, error: 'Payment verification failed' })
+  }
+  res.json({ success: true })
+})
+
 // ── AI usage gate ───────────────────────────────────────────────────────────
 app.post('/api/ai-usage', async (req, res) => {
   const decoded = getUserFromToken(req)
