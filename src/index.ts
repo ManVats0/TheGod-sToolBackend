@@ -76,6 +76,10 @@ const AI_LIMITS: Record<string, number> = {
   enterprise: 500
 }
 
+// Rupees per credit for custom top-up payments — priced above your best
+// subscription rate (Pro: ~₹1.02/transform) so plans stay the better deal.
+const RUPEES_PER_CREDIT = 2
+
 // Issues a session + JWT, enforcing the plan's concurrent-login limit
 async function issueSessionAndToken(user: any, device: string): Promise<{ token?: string; error?: string }> {
   const limit = PLAN_SESSION_LIMITS[user.plan] || 1
@@ -362,7 +366,8 @@ app.get('/api/plan', async (req, res) => {
     planExpiresAt: user.planExpiresAt,
     aiUsageToday: user.aiUsageToday,
     aiUsageDate: user.aiUsageDate,
-    name: user.name || null
+    name: user.name || null,
+    credits: user.credits || 0
   })
 })
 
@@ -428,17 +433,18 @@ app.post('/api/create-custom-order', async (req, res) => {
     return res.status(400).json({ error: 'Enter a valid amount greater than 0' })
   }
   const selectedCurrency = currency === 'USD' ? 'USD' : 'INR'
+  const creditsToGrant = selectedCurrency === 'INR' ? Math.floor(amountNum / RUPEES_PER_CREDIT) : 0
   try {
     const order = await razorpay.orders.create({
       amount: Math.round(amountNum * 100), // Razorpay wants the smallest unit (paise/cents)
       currency: selectedCurrency,
       receipt: `custom_${Date.now()}`,
       payment_capture: true, // auto-capture so funds actually settle, not just authorize
-      notes: { userId: decoded.userId, type: 'custom_payment' }
+      notes: { userId: decoded.userId, type: 'custom_payment', credits: String(creditsToGrant) }
     })
-    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.RAZORPAY_KEY_ID })
+    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, credits: creditsToGrant, key: process.env.RAZORPAY_KEY_ID })
   } catch (err: any) {
-    console.error('🔴 Razorpay create-custom-order error:', err)
+    console.error('Razorpay create-custom-order error:', err)
     res.status(500).json({ error: 'Could not create payment order' })
   }
 })
@@ -462,7 +468,25 @@ app.post('/api/verify-custom-payment', async (req, res) => {
   if (expectedSignature !== razorpay_signature) {
     return res.status(400).json({ success: false, error: 'Payment verification failed' })
   }
-  res.json({ success: true })
+
+  // Pull the order back from Razorpay — the source of truth for how many
+  // credits this payment is worth, not anything the client sends.
+  const order = await razorpay.orders.fetch(razorpay_order_id)
+  const orderUserId = order.notes?.userId
+  const creditsToAdd = parseInt(String(order.notes?.credits || '0'), 10)
+
+  if (orderUserId !== decoded.userId) {
+    return res.status(403).json({ success: false, error: 'Order does not belong to this user' })
+  }
+
+  if (creditsToAdd > 0) {
+    await User.updateOne(
+      { _id: decoded.userId },
+      { $inc: { credits: creditsToAdd } }
+    )
+  }
+
+  res.json({ success: true, creditsAdded: creditsToAdd })
 })
 
 // ── AI usage gate ───────────────────────────────────────────────────────────
