@@ -12,6 +12,7 @@ const userSchema = new mongoose.Schema({
   planExpiresAt: { type: Date, default: () => new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) },
   razorpaySubscriptionId: { type: String, default: null },
   hasUsedTrial: { type: Boolean, default: true },
+  credits: { type: Number, default: 0 },
   aiUsageToday: { type: Number, default: 0 },
   aiUsageDate: { type: String, default: null },
   sessions: {
