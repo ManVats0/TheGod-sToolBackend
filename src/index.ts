@@ -367,7 +367,9 @@ app.get('/api/plan', async (req, res) => {
     aiUsageToday: user.aiUsageToday,
     aiUsageDate: user.aiUsageDate,
     name: user.name || null,
-    credits: user.credits || 0
+    credits: user.credits || 0,
+    customCreditsINR: user.customCreditsINR || 0,
+    customCreditsUSD: user.customCreditsUSD || 0
   })
 })
 
@@ -451,8 +453,8 @@ app.post('/api/create-custom-order', async (req, res) => {
 
 // ── Verify the one-time custom payment ──────────────────────────────────────
 // Order signature formula differs from the Subscription one above:
-// HMAC_SHA256(order_id + "|" + payment_id, key_secret). No DB/plan changes —
-// this route only confirms the payment is genuine.
+// HMAC_SHA256(order_id + "|" + payment_id, key_secret). No plan changes —
+// this route only confirms the payment is genuine and credits the user.
 app.post('/api/verify-custom-payment', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
@@ -469,8 +471,9 @@ app.post('/api/verify-custom-payment', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Payment verification failed' })
   }
 
-  // Pull the order back from Razorpay — the source of truth for how many
-  // credits this payment is worth, not anything the client sends.
+  // Pull the order back from Razorpay — the source of truth for both the
+  // legacy "credits" grant (via notes) and the real charged amount/currency
+  // (via order.amount/order.currency). Neither is trusted from req.body.
   const order = await razorpay.orders.fetch(razorpay_order_id)
   const orderUserId = order.notes?.userId
   const creditsToAdd = parseInt(String(order.notes?.credits || '0'), 10)
@@ -479,14 +482,29 @@ app.post('/api/verify-custom-payment', async (req, res) => {
     return res.status(403).json({ success: false, error: 'Order does not belong to this user' })
   }
 
-  if (creditsToAdd > 0) {
-    await User.updateOne(
-      { _id: decoded.userId },
-      { $inc: { credits: creditsToAdd } }
-    )
-  }
+  // Razorpay confirms the amount in the smallest currency unit (paise for
+  // INR, cents for USD) and the currency the order was actually created in.
+  // customCreditsINR / customCreditsUSD are tracked separately and never
+  // converted between each other — a ₹500 order adds ₹500, a $10 order adds $10.
+  const chargedAmount = Number(order.amount) / 100
+  const chargedCurrency = order.currency === 'USD' ? 'USD' : 'INR'
+  const balanceField = chargedCurrency === 'USD' ? 'customCreditsUSD' : 'customCreditsINR'
 
-  res.json({ success: true, creditsAdded: creditsToAdd })
+  const incUpdate: Record<string, number> = { [balanceField]: chargedAmount }
+  if (creditsToAdd > 0) incUpdate.credits = creditsToAdd
+
+  const updatedUser = await User.findOneAndUpdate(
+    { _id: decoded.userId },
+    { $inc: incUpdate },
+    { new: true }
+  )
+
+  res.json({
+    success: true,
+    creditsAdded: creditsToAdd,
+    customCreditsINR: updatedUser?.customCreditsINR || 0,
+    customCreditsUSD: updatedUser?.customCreditsUSD || 0
+  })
 })
 
 // ── AI usage gate ───────────────────────────────────────────────────────────
