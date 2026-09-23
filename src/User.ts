@@ -13,6 +13,8 @@ const userSchema = new mongoose.Schema({
   razorpaySubscriptionId: { type: String, default: null },
   hasUsedTrial: { type: Boolean, default: true },
   credits: { type: Number, default: 0 },
+  customCreditsINR: { type: Number, default: 0 },
+  customCreditsUSD: { type: Number, default: 0 },
   aiUsageToday: { type: Number, default: 0 },
   aiUsageDate: { type: String, default: null },
   sessions: {
