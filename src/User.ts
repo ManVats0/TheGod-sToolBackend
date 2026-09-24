@@ -1,6 +1,33 @@
-import mongoose from 'mongoose'
+import mongoose, { Document, Model } from 'mongoose'
 
-const userSchema = new mongoose.Schema({
+export interface ISession {
+  sessionId: string
+  device: string
+  createdAt: Date
+  lastActive: Date
+}
+
+export interface IUser extends Document {
+  email: string
+  password: string | null
+  googleId: string | null
+  name: string | null
+  resetToken: string | null
+  resetTokenExpiry: Date | null
+  createdAt: Date
+  plan: 'none' | 'trial' | 'lite' | 'starter' | 'pro' | 'team' | 'enterprise'
+  planExpiresAt: Date | null
+  razorpaySubscriptionId: string | null
+  hasUsedTrial: boolean
+  credits: number
+  customCreditsINR: number
+  customCreditsUSD: number
+  aiUsageToday: number
+  aiUsageDate: string | null
+  sessions: ISession[]
+}
+
+const userSchema = new mongoose.Schema<IUser>({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   password: { type: String, default: null },
   googleId: { type: String, default: null },
@@ -28,4 +55,5 @@ const userSchema = new mongoose.Schema({
   }
 })
 
-export default mongoose.model('User', userSchema)
+const User: Model<IUser> = mongoose.model<IUser>('User', userSchema)
+export default User
