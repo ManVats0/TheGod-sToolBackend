@@ -7,6 +7,7 @@ import dotenv from 'dotenv'
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
 import User from './User'
+import Organization from './Organization' // NEW
 import { OAuth2Client } from 'google-auth-library'
 
 dotenv.config()
@@ -115,6 +116,23 @@ function getUserFromToken(req: express.Request): { userId: string; email: string
   }
 }
 
+// ── NEW: Ensure a user has an organization, creating one if this is their ──
+// first time. Called right after a user is created/found in register,
+// login-via-Google, and the OAuth callback route. Existing users who
+// predate this feature get an org lazily the next time they hit /api/org.
+async function ensureOrganization(user: any): Promise<void> {
+  if (user.organizationId) return
+  const org = await Organization.create({
+    name: user.name ? `${user.name}'s Team` : `${user.email.split('@')[0]}'s Team`,
+    ownerId: user._id,
+    members: [{ userId: user._id, role: 'owner', joinedAt: new Date() }]
+  })
+  await User.updateOne(
+    { _id: user._id },
+    { $set: { organizationId: org._id, role: 'owner' } }
+  )
+}
+
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password } = req.body
@@ -127,6 +145,7 @@ app.post('/api/register', async (req, res) => {
 
     const hashed = await bcrypt.hash(password, 10)
     const user = await User.create({ email, password: hashed })
+    await ensureOrganization(user) // NEW
 
     const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
     if (error) return res.status(429).json({ error })
@@ -153,6 +172,8 @@ app.post('/api/login', async (req, res) => {
     if (req.body.forceLogout) {
       await evictOldestSession(user._id)
     }
+
+    await ensureOrganization(user) // NEW — backfills orgs for pre-existing users
 
     const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
     if (error) return res.status(429).json({ error })
@@ -183,6 +204,8 @@ app.post('/api/google', async (req, res) => {
     if (forceLogout) {
       await evictOldestSession(user._id)
     }
+
+    await ensureOrganization(user) // NEW
 
     const { token, error } = await issueSessionAndToken(user, req.headers['user-agent'] || 'Unknown device')
     if (error) return res.status(429).json({ error })
@@ -221,6 +244,8 @@ app.get('/api/google/callback', async (req, res) => {
       { $set: { googleId: payload.sub, name: payload.name } },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     )
+
+    await ensureOrganization(user) // NEW
 
     const { token, error } = await issueSessionAndToken(user, (req.headers['user-agent'] as string) || 'Unknown device')
     if (error) {
@@ -533,6 +558,134 @@ app.post('/api/ai-usage', async (req, res) => {
     { $set: { aiUsageDate: today, aiUsageToday: usageCount + 1 } }
   )
   return res.json({ allowed: true, usageToday: usageCount + 1, limit })
+})
+
+// ── NEW: Team / data-governance routes ──────────────────────────────────────
+
+// GET /api/org — the caller's organization + populated member list.
+// This is the route your Team.tsx page should call. Lazily creates an org
+// for any pre-existing user who somehow still has none.
+app.get('/api/org', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const user = await User.findById(decoded.userId)
+  if (!user) return res.status(404).json({ error: 'User not found' })
+
+  await ensureOrganization(user)
+  const freshUser = await User.findById(decoded.userId)
+
+  const org = await Organization.findById(freshUser!.organizationId)
+    .populate('members.userId', 'email name')
+  if (!org) return res.status(404).json({ error: 'Organization not found' })
+
+  res.json({
+    orgId: org._id,
+    name: org.name,
+    yourRole: freshUser!.role,
+    members: org.members.map((m: any) => ({
+      userId: m.userId._id,
+      email: m.userId.email,
+      name: m.userId.name,
+      role: m.role,
+      joinedAt: m.joinedAt
+    }))
+  })
+})
+
+// POST /api/org/invite — add an existing registered user to the org by email.
+// Gated to owner/admin. (Wiring up invite emails for not-yet-registered
+// users is a separate follow-up — this handles the common case first.)
+app.post('/api/org/invite', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const caller = await User.findById(decoded.userId)
+  if (!caller || !caller.organizationId) return res.status(404).json({ error: 'Organization not found' })
+  if (caller.role !== 'owner' && caller.role !== 'admin') {
+    return res.status(403).json({ error: 'Only owners and admins can invite members' })
+  }
+
+  const { email, role } = req.body
+  if (!email || !['admin', 'editor', 'viewer'].includes(role)) {
+    return res.status(400).json({ error: 'Valid email and role (admin, editor, or viewer) required' })
+  }
+
+  const invitee = await User.findOne({ email })
+  if (!invitee) return res.status(404).json({ error: 'No registered user found with that email' })
+  if (invitee.organizationId) return res.status(400).json({ error: 'That user already belongs to an organization' })
+
+  await Organization.updateOne(
+    { _id: caller.organizationId },
+    { $push: { members: { userId: invitee._id, role, joinedAt: new Date() } } }
+  )
+  await User.updateOne(
+    { _id: invitee._id },
+    { $set: { organizationId: caller.organizationId, role } }
+  )
+
+  res.json({ success: true })
+})
+
+// PATCH /api/org/member/:userId/role — change a member's role. Owner/admin only.
+app.patch('/api/org/member/:userId/role', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const caller = await User.findById(decoded.userId)
+  if (!caller || !caller.organizationId) return res.status(404).json({ error: 'Organization not found' })
+  if (caller.role !== 'owner' && caller.role !== 'admin') {
+    return res.status(403).json({ error: 'Only owners and admins can change roles' })
+  }
+
+  const { role } = req.body
+  const { userId: targetUserId } = req.params
+  if (!['admin', 'editor', 'viewer'].includes(role)) {
+    return res.status(400).json({ error: 'Valid role (admin, editor, or viewer) required' })
+  }
+
+  const org = await Organization.findById(caller.organizationId)
+  if (!org) return res.status(404).json({ error: 'Organization not found' })
+  const targetMember = org.members.find((m: any) => m.userId.toString() === targetUserId)
+  if (!targetMember) return res.status(404).json({ error: 'Member not found in this organization' })
+  if (targetMember.role === 'owner') return res.status(403).json({ error: "Can't change the owner's role" })
+
+  await Organization.updateOne(
+    { _id: caller.organizationId, 'members.userId': targetUserId },
+    { $set: { 'members.$.role': role } }
+  )
+  await User.updateOne({ _id: targetUserId }, { $set: { role } })
+
+  res.json({ success: true })
+})
+
+// DELETE /api/org/member/:userId — remove a member from the org. Owner/admin only.
+app.delete('/api/org/member/:userId', async (req, res) => {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const caller = await User.findById(decoded.userId)
+  if (!caller || !caller.organizationId) return res.status(404).json({ error: 'Organization not found' })
+  if (caller.role !== 'owner' && caller.role !== 'admin') {
+    return res.status(403).json({ error: 'Only owners and admins can remove members' })
+  }
+
+  const { userId: targetUserId } = req.params
+  if (targetUserId === caller._id.toString()) {
+    return res.status(400).json({ error: "You can't remove yourself. Transfer ownership first." })
+  }
+
+  const org = await Organization.findById(caller.organizationId)
+  if (!org) return res.status(404).json({ error: 'Organization not found' })
+  const targetMember = org.members.find((m: any) => m.userId.toString() === targetUserId)
+  if (targetMember?.role === 'owner') return res.status(403).json({ error: "Can't remove the owner" })
+
+  await Organization.updateOne(
+    { _id: caller.organizationId },
+    { $pull: { members: { userId: targetUserId } } }
+  )
+  // Removed member gets their own fresh org so they aren't left in limbo.
+  await User.updateOne({ _id: targetUserId }, { $set: { organizationId: null, role: null } })
+  const removedUser = await User.findById(targetUserId)
+  if (removedUser) await ensureOrganization(removedUser)
+
+  res.json({ success: true })
 })
 
 // ── Razorpay webhook (optional but recommended) ─────────────────────────────
