@@ -25,6 +25,9 @@ export interface IUser extends Document {
   aiUsageToday: number
   aiUsageDate: string | null
   sessions: ISession[]
+  // ── Team / data-governance fields ─────────────────────────────────────────
+  organizationId: mongoose.Types.ObjectId | null
+  role: 'owner' | 'admin' | 'editor' | 'viewer' | null
 }
 
 const userSchema = new mongoose.Schema<IUser>({
@@ -52,7 +55,10 @@ const userSchema = new mongoose.Schema<IUser>({
       lastActive: { type: Date, default: Date.now }
     }],
     default: []
-  }
+  },
+  // ── Team / data-governance fields ─────────────────────────────────────────
+  organizationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null },
+  role: { type: String, enum: ['owner', 'admin', 'editor', 'viewer', null], default: null }
 })
 
 const User: Model<IUser> = mongoose.model<IUser>('User', userSchema)
