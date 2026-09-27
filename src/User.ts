@@ -25,7 +25,7 @@ export interface IUser extends Document {
   aiUsageToday: number
   aiUsageDate: string | null
   sessions: ISession[]
-  // ── Team / data-governance fields ─────────────────────────────────────────
+  // ── Team / data-governance fields ────────────────────────────────────────
   organizationId: mongoose.Types.ObjectId | null
   role: 'owner' | 'admin' | 'editor' | 'viewer' | null
 }
