@@ -7,7 +7,7 @@ import dotenv from 'dotenv'
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
 import User from './User'
-import Organization from './Organization' // NEW
+// import Organization from './Organization' // NEW
 import { OAuth2Client } from 'google-auth-library'
 
 dotenv.config()
@@ -81,13 +81,49 @@ const AI_LIMITS: Record<string, number> = {
 // subscription rate (Pro: ~₹1.02/transform) so plans stay the better deal.
 const RUPEES_PER_CREDIT = 2
 
-// Issues a session + JWT, enforcing the plan's concurrent-login limit
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+function isAdminEmail(email?: string | null): boolean {
+  const list = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
+  return !!email && list.includes(email.toLowerCase())
+}
+
+// Reads the teams that main.py owns (org_members / organizations).
+async function getOrgContext(userId: string): Promise<{ ownerId: string; isMember: boolean; orgUserIds: string[] }> {
+  const self = String(userId)
+  const fallback = { ownerId: self, isMember: false, orgUserIds: [self] }
+  const db = mongoose.connection.db
+  if (!db) return fallback
+  const membership = await db.collection('org_members').findOne({ userId: self, status: 'active' })
+  if (!membership) return fallback
+  const org = await db.collection('organizations').findOne({ _id: membership.orgId })
+  const ownerId = String(org?.ownerId || self)
+  const rows = await db.collection('org_members').find({ orgId: membership.orgId, status: 'active' }).toArray()
+  const ids = new Set<string>([ownerId, self])
+  rows.forEach((r: any) => ids.add(String(r.userId)))
+  return { ownerId, isMember: membership.roleKey !== 'owner', orgUserIds: Array.from(ids) }
+}
+
+// Issues a session + JWT. The login limit is org-wide and uses the OWNER's plan.
 async function issueSessionAndToken(user: any, device: string): Promise<{ token?: string; error?: string }> {
-  const limit = PLAN_SESSION_LIMITS[user.plan] || 1
-  const sessions = user.sessions || []
-  if (sessions.length >= limit) {
-    return { error: `Login limit reached for your plan (max ${limit} device${limit > 1 ? 's' : ''} signed in at once). Log out on another device or upgrade your plan.` }
+  const orgCtx = await getOrgContext(String(user._id))
+
+  // Purge expired (>7 days) sessions across the whole org first.
+  await User.updateMany(
+    { _id: { $in: orgCtx.orgUserIds } },
+    { $pull: { sessions: { createdAt: { $lt: new Date(Date.now() - SESSION_MAX_AGE_MS) } } } } as any
+  )
+
+  if (!isAdminEmail(user.email)) {
+    const ownerDoc = orgCtx.isMember ? await User.findById(orgCtx.ownerId) : user
+    const limit = PLAN_SESSION_LIMITS[(ownerDoc || user).plan] || 1
+    const orgUsers = await User.find({ _id: { $in: orgCtx.orgUserIds } }, { sessions: 1 })
+    const active = orgUsers.reduce((n: number, u: any) => n + (u.sessions?.length || 0), 0)
+    if (active >= limit) {
+      return { error: `Login limit reached for your plan (max ${limit} device${limit > 1 ? 's' : ''} signed in at once across your team). Log out on another device or upgrade your plan.` }
+    }
   }
+
   const sessionId = crypto.randomUUID()
   await User.updateOne(
     { _id: user._id },
@@ -97,12 +133,22 @@ async function issueSessionAndToken(user: any, device: string): Promise<{ token?
   return { token }
 }
 
-// Evicts the session that's been inactive the longest, freeing one concurrent-login slot
+// Evicts the oldest session across the whole org, freeing one login slot
 async function evictOldestSession(userId: any): Promise<void> {
-  const user = await User.findById(userId)
-  if (!user || !user.sessions || user.sessions.length === 0) return
-  const oldest = user.sessions.reduce((a: any, b: any) => (a.lastActive < b.lastActive ? a : b))
-  await User.updateOne({ _id: userId }, { $pull: { sessions: { sessionId: oldest.sessionId } } })
+  const orgCtx = await getOrgContext(String(userId))
+  const users = await User.find({ _id: { $in: orgCtx.orgUserIds } }, { sessions: 1 })
+  let oldest: any = null
+  let oldestOwnerId: any = null
+  for (const u of users) {
+    for (const s of (u.sessions || []) as any[]) {
+      if (!oldest || s.lastActive < oldest.lastActive) {
+        oldest = s
+        oldestOwnerId = u._id
+      }
+    }
+  }
+  if (!oldest) return
+  await User.updateOne({ _id: oldestOwnerId }, { $pull: { sessions: { sessionId: oldest.sessionId } } })
 }
 
 // Helper: decode JWT from Authorization header
@@ -120,8 +166,9 @@ function getUserFromToken(req: express.Request): { userId: string; email: string
 // first time. Called right after a user is created/found in register,
 // login-via-Google, and the OAuth callback route. Existing users who
 // predate this feature get an org lazily the next time they hit /api/org.
-async function ensureOrganization(user: any): Promise<void> {
-  if (user.organizationId) return
+async function ensureOrganization(_user: any): Promise<void> {
+  // Teams are owned by the FastAPI service (main.py). Intentionally empty.
+}
   const org = await Organization.create({
     name: user.name ? `${user.name}'s Team` : `${user.email.split('@')[0]}'s Team`,
     ownerId: user._id,
@@ -185,18 +232,28 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/google', async (req, res) => {
   try {
-    const { email, googleId, name, forceLogout } = req.body
-    console.log('🟢 Google login received:', { email, googleId, name })
-    if (!email || !googleId)
+    const { credential, forceLogout } = req.body
+    if (!credential || typeof credential !== 'string')
+      return res.status(400).json({ error: 'Missing Google credential' })
+
+    let payload
+    try {
+      const ticket = await googleOAuthClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID!
+      })
+      payload = ticket.getPayload()
+    } catch {
+      return res.status(401).json({ error: 'Invalid Google credential' })
+    }
+    if (!payload?.email || !payload?.sub)
       return res.status(400).json({ error: 'Missing Google data' })
 
     const user = await User.findOneAndUpdate(
-      { email },
-      { $set: { googleId, name } },
+      { email: payload.email },
+      { $set: { googleId: payload.sub, name: payload.name } },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     )
-
-    console.log('🟢 User saved/updated:', user)
 
     if (!user)
       return res.status(500).json({ error: 'Failed to create or update user' })
@@ -375,8 +432,10 @@ app.post('/api/save-alert-email', async (req, res) => {
 app.get('/api/plan', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const user = await User.findById(decoded.userId)
-  if (!user) return res.status(404).json({ error: 'User not found' })
+  const caller = await User.findById(decoded.userId)
+  if (!caller) return res.status(404).json({ error: 'User not found' })
+  const orgCtx = await getOrgContext(decoded.userId)
+  const user = (orgCtx.isMember ? await User.findById(orgCtx.ownerId) : caller) || caller
 
   // Downgrade expired trials to 'none' before responding.
   // Only touches users on 'trial' — never affects paid plans or existing 'none' users.
@@ -387,11 +446,11 @@ app.get('/api/plan', async (req, res) => {
   }
 
   res.json({
-    plan: user.plan,
+    plan: isAdminEmail(caller.email) ? 'enterprise' : user.plan,
     planExpiresAt: user.planExpiresAt,
     aiUsageToday: user.aiUsageToday,
     aiUsageDate: user.aiUsageDate,
-    name: user.name || null,
+    name: caller.name || null,
     credits: user.credits || 0,
     customCreditsINR: user.customCreditsINR || 0,
     customCreditsUSD: user.customCreditsUSD || 0
@@ -402,6 +461,8 @@ app.get('/api/plan', async (req, res) => {
 app.post('/api/subscribe', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  if ((await getOrgContext(decoded.userId)).isMember)
+    return res.status(403).json({ error: 'Billing is managed by your team owner' })
   const { planKey, billingCycle, currency } = req.body
   if (!PLAN_IDS[planKey]) return res.status(400).json({ error: 'Invalid plan' })
   if (billingCycle !== 'monthly' && billingCycle !== 'yearly') return res.status(400).json({ error: 'Invalid billing cycle' })
@@ -426,6 +487,8 @@ app.post('/api/subscribe', async (req, res) => {
 app.post('/api/verify-payment', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  if ((await getOrgContext(decoded.userId)).isMember)
+    return res.status(403).json({ error: 'Billing is managed by your team owner' })
   const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, planKey, billingCycle } = req.body
   const body = razorpay_payment_id + '|' + razorpay_subscription_id
   const expectedSignature = crypto
@@ -454,6 +517,8 @@ app.post('/api/verify-payment', async (req, res) => {
 app.post('/api/create-custom-order', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  if ((await getOrgContext(decoded.userId)).isMember)
+    return res.status(403).json({ error: 'Billing is managed by your team owner' })
   const { amount, currency } = req.body
   const amountNum = Number(amount)
   if (!amountNum || amountNum <= 0) {
@@ -536,12 +601,14 @@ app.post('/api/verify-custom-payment', async (req, res) => {
 app.post('/api/ai-usage', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const user = await User.findById(decoded.userId)
-  if (!user) return res.status(404).json({ error: 'User not found' })
+  const caller = await User.findById(decoded.userId)
+  if (!caller) return res.status(404).json({ error: 'User not found' })
+  const orgCtx = await getOrgContext(decoded.userId)
+  const user = (orgCtx.isMember ? await User.findById(orgCtx.ownerId) : caller) || caller
 
   const today = new Date().toISOString().slice(0, 10)
 
-  const limit = AI_LIMITS[user.plan]
+  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : user.plan]
   if (!limit) {
     return res.status(403).json({ error: 'no_plan', message: 'Upgrade to use AI features' })
   }
@@ -554,138 +621,10 @@ app.post('/api/ai-usage', async (req, res) => {
   }
 
   await User.updateOne(
-    { _id: decoded.userId },
+    { _id: user._id },
     { $set: { aiUsageDate: today, aiUsageToday: usageCount + 1 } }
   )
   return res.json({ allowed: true, usageToday: usageCount + 1, limit })
-})
-
-// ── NEW: Team / data-governance routes ──────────────────────────────────────
-
-// GET /api/org — the caller's organization + populated member list.
-// This is the route your Team.tsx page should call. Lazily creates an org
-// for any pre-existing user who somehow still has none.
-app.get('/api/org', async (req, res) => {
-  const decoded = getUserFromToken(req)
-  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const user = await User.findById(decoded.userId)
-  if (!user) return res.status(404).json({ error: 'User not found' })
-
-  await ensureOrganization(user)
-  const freshUser = await User.findById(decoded.userId)
-
-  const org = await Organization.findById(freshUser!.organizationId)
-    .populate('members.userId', 'email name')
-  if (!org) return res.status(404).json({ error: 'Organization not found' })
-
-  res.json({
-    orgId: org._id,
-    name: org.name,
-    yourRole: freshUser!.role,
-    members: org.members.map((m: any) => ({
-      userId: m.userId._id,
-      email: m.userId.email,
-      name: m.userId.name,
-      role: m.role,
-      joinedAt: m.joinedAt
-    }))
-  })
-})
-
-// POST /api/org/invite — add an existing registered user to the org by email.
-// Gated to owner/admin. (Wiring up invite emails for not-yet-registered
-// users is a separate follow-up — this handles the common case first.)
-app.post('/api/org/invite', async (req, res) => {
-  const decoded = getUserFromToken(req)
-  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const caller = await User.findById(decoded.userId)
-  if (!caller || !caller.organizationId) return res.status(404).json({ error: 'Organization not found' })
-  if (caller.role !== 'owner' && caller.role !== 'admin') {
-    return res.status(403).json({ error: 'Only owners and admins can invite members' })
-  }
-
-  const { email, role } = req.body
-  if (!email || !['admin', 'editor', 'viewer'].includes(role)) {
-    return res.status(400).json({ error: 'Valid email and role (admin, editor, or viewer) required' })
-  }
-
-  const invitee = await User.findOne({ email })
-  if (!invitee) return res.status(404).json({ error: 'No registered user found with that email' })
-  if (invitee.organizationId) return res.status(400).json({ error: 'That user already belongs to an organization' })
-
-  await Organization.updateOne(
-    { _id: caller.organizationId },
-    { $push: { members: { userId: invitee._id, role, joinedAt: new Date() } } }
-  )
-  await User.updateOne(
-    { _id: invitee._id },
-    { $set: { organizationId: caller.organizationId, role } }
-  )
-
-  res.json({ success: true })
-})
-
-// PATCH /api/org/member/:userId/role — change a member's role. Owner/admin only.
-app.patch('/api/org/member/:userId/role', async (req, res) => {
-  const decoded = getUserFromToken(req)
-  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const caller = await User.findById(decoded.userId)
-  if (!caller || !caller.organizationId) return res.status(404).json({ error: 'Organization not found' })
-  if (caller.role !== 'owner' && caller.role !== 'admin') {
-    return res.status(403).json({ error: 'Only owners and admins can change roles' })
-  }
-
-  const { role } = req.body
-  const { userId: targetUserId } = req.params
-  if (!['admin', 'editor', 'viewer'].includes(role)) {
-    return res.status(400).json({ error: 'Valid role (admin, editor, or viewer) required' })
-  }
-
-  const org = await Organization.findById(caller.organizationId)
-  if (!org) return res.status(404).json({ error: 'Organization not found' })
-  const targetMember = org.members.find((m: any) => m.userId.toString() === targetUserId)
-  if (!targetMember) return res.status(404).json({ error: 'Member not found in this organization' })
-  if (targetMember.role === 'owner') return res.status(403).json({ error: "Can't change the owner's role" })
-
-  await Organization.updateOne(
-    { _id: caller.organizationId, 'members.userId': targetUserId },
-    { $set: { 'members.$.role': role } }
-  )
-  await User.updateOne({ _id: targetUserId }, { $set: { role } })
-
-  res.json({ success: true })
-})
-
-// DELETE /api/org/member/:userId — remove a member from the org. Owner/admin only.
-app.delete('/api/org/member/:userId', async (req, res) => {
-  const decoded = getUserFromToken(req)
-  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const caller = await User.findById(decoded.userId)
-  if (!caller || !caller.organizationId) return res.status(404).json({ error: 'Organization not found' })
-  if (caller.role !== 'owner' && caller.role !== 'admin') {
-    return res.status(403).json({ error: 'Only owners and admins can remove members' })
-  }
-
-  const { userId: targetUserId } = req.params
-  if (targetUserId === caller._id.toString()) {
-    return res.status(400).json({ error: "You can't remove yourself. Transfer ownership first." })
-  }
-
-  const org = await Organization.findById(caller.organizationId)
-  if (!org) return res.status(404).json({ error: 'Organization not found' })
-  const targetMember = org.members.find((m: any) => m.userId.toString() === targetUserId)
-  if (targetMember?.role === 'owner') return res.status(403).json({ error: "Can't remove the owner" })
-
-  await Organization.updateOne(
-    { _id: caller.organizationId },
-    { $pull: { members: { userId: targetUserId } } }
-  )
-  // Removed member gets their own fresh org so they aren't left in limbo.
-  await User.updateOne({ _id: targetUserId }, { $set: { organizationId: null, role: null } })
-  const removedUser = await User.findById(targetUserId)
-  if (removedUser) await ensureOrganization(removedUser)
-
-  res.json({ success: true })
 })
 
 // ── Razorpay webhook (optional but recommended) ─────────────────────────────
