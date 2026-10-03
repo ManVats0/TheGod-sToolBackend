@@ -1,36 +1,6 @@
-import mongoose, { Document, Model } from 'mongoose'
+import mongoose from 'mongoose'
 
-export interface ISession {
-  sessionId: string
-  device: string
-  createdAt: Date
-  lastActive: Date
-}
-
-export interface IUser extends Document {
-  email: string
-  password: string | null
-  googleId: string | null
-  name: string | null
-  resetToken: string | null
-  resetTokenExpiry: Date | null
-  createdAt: Date
-  plan: 'none' | 'trial' | 'lite' | 'starter' | 'pro' | 'team' | 'enterprise'
-  planExpiresAt: Date | null
-  razorpaySubscriptionId: string | null
-  hasUsedTrial: boolean
-  credits: number
-  customCreditsINR: number
-  customCreditsUSD: number
-  aiUsageToday: number
-  aiUsageDate: string | null
-  sessions: ISession[]
-  // ── Team / data-governance fields ────────────────────────────────────────
-  organizationId: mongoose.Types.ObjectId | null
-  role: 'owner' | 'admin' | 'editor' | 'viewer' | null
-}
-
-const userSchema = new mongoose.Schema<IUser>({
+const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   password: { type: String, default: null },
   googleId: { type: String, default: null },
@@ -55,11 +25,7 @@ const userSchema = new mongoose.Schema<IUser>({
       lastActive: { type: Date, default: Date.now }
     }],
     default: []
-  },
-  // ── Team / data-governance fields ─────────────────────────────────────────
-  organizationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null },
-  role: { type: String, enum: ['owner', 'admin', 'editor', 'viewer', null], default: null }
+  }
 })
 
-const User: Model<IUser> = mongoose.model<IUser>('User', userSchema)
-export default User
+export default mongoose.model('User', userSchema)
