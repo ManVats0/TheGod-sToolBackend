@@ -17,8 +17,8 @@ app.use(cors({ origin: '*' }))
 app.use(express.json())
 
 mongoose.connect(process.env.MONGODB_URI!)
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('❌ MongoDB error:', err))
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB error:', err))
 
 const JWT_SECRET = process.env.JWT_SECRET!
 
@@ -168,16 +168,6 @@ function getUserFromToken(req: express.Request): { userId: string; email: string
 // predate this feature get an org lazily the next time they hit /api/org.
 async function ensureOrganization(_user: any): Promise<void> {
   // Teams are owned by the FastAPI service (main.py). Intentionally empty.
-}
-  const org = await Organization.create({
-    name: user.name ? `${user.name}'s Team` : `${user.email.split('@')[0]}'s Team`,
-    ownerId: user._id,
-    members: [{ userId: user._id, role: 'owner', joinedAt: new Date() }]
-  })
-  await User.updateOne(
-    { _id: user._id },
-    { $set: { organizationId: org._id, role: 'owner' } }
-  )
 }
 
 app.post('/api/register', async (req, res) => {
