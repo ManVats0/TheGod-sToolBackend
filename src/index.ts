@@ -36,15 +36,31 @@ app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (re
 
 app.use(express.json())
 
-// Brute-force protection for auth endpoints (per IP)
+// Brute-force protection. Only FAILED attempts (status >= 400) count, so normal users are never
+// blocked even if many of them share one IP address behind a proxy.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
+  skipSuccessfulRequests: true,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Too many attempts. Please try again in a few minutes.' }
 })
-app.use(['/api/login', '/api/register', '/api/forgot-password', '/api/reset-password', '/api/google'], authLimiter)
+app.use(['/api/login', '/api/register', '/api/reset-password', '/api/google'], authLimiter)
+
+// Limits reset emails per address (stops email-bombing someone). Always "succeeds", so it counts all requests.
+const forgotLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  keyGenerator: (req) => {
+    const e = (req.body as any)?.email
+    return typeof e === 'string' && e ? 'email:' + e.toLowerCase().slice(0, 254) : 'ip:' + req.ip
+  },
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many reset requests. Please try again later.' }
+})
+app.use('/api/forgot-password', forgotLimiter)
 
 mongoose.connect(process.env.MONGODB_URI!)
   .then(() => console.log('MongoDB connected'))
@@ -693,11 +709,19 @@ app.post('/api/verify-custom-payment', async (req, res) => {
   const incUpdate: Record<string, number> = { [balanceField]: chargedAmount }
   if (creditsToAdd > 0) incUpdate.credits = creditsToAdd
 
-  const updatedUser = await User.findOneAndUpdate(
-    { _id: decoded.userId },
-    { $inc: incUpdate },
-    { new: true }
-  )
+  let updatedUser: any
+  try {
+    updatedUser = await User.findOneAndUpdate(
+      { _id: decoded.userId },
+      { $inc: incUpdate },
+      { new: true }
+    )
+  } catch (err) {
+    // Crediting failed: undo the "processed" marker so the user can retry and is not charged for nothing.
+    console.error('🔴 Credit update failed, rolling back payment marker:', err)
+    await ProcessedPayment.deleteOne({ paymentId: razorpay_payment_id }).catch(() => {})
+    return res.status(500).json({ success: false, error: 'Could not credit payment. Please retry or contact support.' })
+  }
 
   res.json({
     success: true,
