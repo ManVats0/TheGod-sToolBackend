@@ -9,12 +9,42 @@ import crypto from 'crypto'
 import User from './User'
 // import Organization from './Organization' // NEW
 import { OAuth2Client } from 'google-auth-library'
+import rateLimit from 'express-rate-limit'
 
 dotenv.config()
 
 const app = express()
+app.set('trust proxy', 1) // Railway sits behind a proxy; needed for correct client IPs
 app.use(cors({ origin: '*' }))
+
+// ── Razorpay webhook ────────────────────────────────────────────────────────
+// Must be registered BEFORE express.json(): signature verification needs the raw body.
+// Uses its own secret (Razorpay Dashboard → Webhooks → secret), NOT the API key secret.
+app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (req, res) => {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET
+  if (!secret) return res.status(503).json({ error: 'Webhook not configured' })
+  const signature = String(req.headers['x-razorpay-signature'] || '')
+  const digest = crypto.createHmac('sha256', secret).update(req.body).digest('hex')
+  const a = Buffer.from(digest)
+  const b = Buffer.from(signature)
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(400).json({ error: 'Invalid signature' })
+  }
+  // You can handle subscription cancellation/renewal here later
+  res.json({ received: true })
+})
+
 app.use(express.json())
+
+// Brute-force protection for auth endpoints (per IP)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again in a few minutes.' }
+})
+app.use(['/api/login', '/api/register', '/api/forgot-password', '/api/reset-password', '/api/google'], authLimiter)
 
 mongoose.connect(process.env.MONGODB_URI!)
   .then(() => console.log('MongoDB connected'))
@@ -162,6 +192,29 @@ function getUserFromToken(req: express.Request): { userId: string; email: string
   }
 }
 
+// One row per credited payment — prevents the same payment being credited twice (replay).
+const ProcessedPayment = mongoose.model('ProcessedPayment', new mongoose.Schema({
+  paymentId: { type: String, required: true, unique: true },
+  userId: { type: String },
+  createdAt: { type: Date, default: Date.now }
+}))
+
+// Like getUserFromToken, but also requires the session to still exist.
+// This makes logout / "log out other device" actually invalidate the token.
+// Tokens without a sessionId (very old ones) are still accepted.
+async function authenticate(req: express.Request): Promise<{ userId: string; email: string; sessionId?: string } | null> {
+  const decoded = getUserFromToken(req)
+  if (!decoded) return null
+  if (decoded.sessionId) {
+    const alive = await User.exists({ _id: decoded.userId, 'sessions.sessionId': decoded.sessionId })
+    if (!alive) return null
+  }
+  return decoded
+}
+
+const hashToken = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
+const isEmail = (e: any) => typeof e === 'string' && e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
+
 // ── NEW: Ensure a user has an organization, creating one if this is their ──
 // first time. Called right after a user is created/found in register,
 // login-via-Google, and the OAuth callback route. Existing users who
@@ -175,6 +228,10 @@ app.post('/api/register', async (req, res) => {
     const { email, password } = req.body
     if (!email || !password)
       return res.status(400).json({ error: 'Email and password required' })
+    if (!isEmail(email) || typeof password !== 'string')
+      return res.status(400).json({ error: 'Enter a valid email address' })
+    if (password.length < 8 || password.length > 128)
+      return res.status(400).json({ error: 'Password must be 8–128 characters' })
 
     const exists = await User.findOne({ email })
     if (exists)
@@ -197,6 +254,8 @@ app.post('/api/login', async (req, res) => {
     const { email, password } = req.body
     if (!email || !password)
       return res.status(400).json({ error: 'Email and password required' })
+    if (typeof email !== 'string' || typeof password !== 'string')
+      return res.status(400).json({ error: 'Invalid credentials' })
 
     const user = await User.findOne({ email })
     if (!user || !user.password)
@@ -238,6 +297,8 @@ app.post('/api/google', async (req, res) => {
     }
     if (!payload?.email || !payload?.sub)
       return res.status(400).json({ error: 'Missing Google data' })
+    if (!payload.email_verified)
+      return res.status(400).json({ error: 'Your Google email is not verified' })
 
     const user = await User.findOneAndUpdate(
       { email: payload.email },
@@ -282,7 +343,7 @@ app.get('/api/google/callback', async (req, res) => {
       audience: process.env.GOOGLE_CLIENT_ID!
     })
     const payload = ticket.getPayload()
-    if (!payload?.email || !payload?.sub) {
+    if (!payload?.email || !payload?.sub || !payload.email_verified) {
       return res.redirect(`${process.env.FRONTEND_URL}/?googleError=invalid_payload`)
     }
 
@@ -309,15 +370,17 @@ app.get('/api/google/callback', async (req, res) => {
 app.post('/api/forgot-password', async (req, res) => {
   try {
     const { email } = req.body
-    if (!email) return res.status(400).json({ error: 'Email required' })
+    if (!email || typeof email !== 'string') return res.status(400).json({ error: 'Email required' })
 
     const user = await User.findOne({ email })
-    if (!user) return res.status(400).json({ error: 'No account found with that email' })
+    // Same response whether or not the account exists (prevents email enumeration)
+    if (!user) return res.json({ message: 'Reset link sent' })
 
-    const resetToken = require('crypto').randomBytes(32).toString('hex')
+    const resetToken = crypto.randomBytes(32).toString('hex')
     const resetTokenExpiry = new Date(Date.now() + 1000 * 60 * 60) // 1 hour
 
-    await User.updateOne({ email }, { $set: { resetToken, resetTokenExpiry } })
+    // Only a hash is stored; the raw token only exists in the emailed link
+    await User.updateOne({ email }, { $set: { resetToken: hashToken(resetToken), resetTokenExpiry } })
 
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`
 
@@ -349,9 +412,13 @@ app.post('/api/reset-password', async (req, res) => {
   try {
     const { token, password } = req.body
     if (!token || !password) return res.status(400).json({ error: 'Token and password required' })
+    if (typeof token !== 'string' || typeof password !== 'string')
+      return res.status(400).json({ error: 'Invalid request' })
+    if (password.length < 8 || password.length > 128)
+      return res.status(400).json({ error: 'Password must be 8–128 characters' })
 
     const user = await User.findOne({
-      resetToken: token,
+      resetToken: hashToken(token),
       resetTokenExpiry: { $gt: new Date() }
     })
 
@@ -360,7 +427,7 @@ app.post('/api/reset-password', async (req, res) => {
     const hashed = await bcrypt.hash(password, 10)
     await User.updateOne(
       { _id: user._id },
-      { $set: { password: hashed }, $unset: { resetToken: '', resetTokenExpiry: '' } }
+      { $set: { password: hashed, sessions: [] }, $unset: { resetToken: '', resetTokenExpiry: '' } }
     )
 
     res.json({ message: 'Password reset successful' })
@@ -420,7 +487,7 @@ app.post('/api/save-alert-email', async (req, res) => {
 
 // ── Plan info ───────────────────────────────────────────────────────────────
 app.get('/api/plan', async (req, res) => {
-  const decoded = getUserFromToken(req)
+  const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   const caller = await User.findById(decoded.userId)
   if (!caller) return res.status(404).json({ error: 'User not found' })
@@ -449,7 +516,7 @@ app.get('/api/plan', async (req, res) => {
 
 // ── Create Razorpay subscription ────────────────────────────────────────────
 app.post('/api/subscribe', async (req, res) => {
-  const decoded = getUserFromToken(req)
+  const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   if ((await getOrgContext(decoded.userId)).isMember)
     return res.status(403).json({ error: 'Billing is managed by your team owner' })
@@ -464,7 +531,8 @@ app.post('/api/subscribe', async (req, res) => {
       plan_id: razorpayPlanId,
       customer_notify: 1,
       quantity: 1,
-      total_count: billingCycle === 'yearly' ? 1 : 12
+      total_count: billingCycle === 'yearly' ? 1 : 12,
+      notes: { userId: String(decoded.userId) }
     })
     res.json({ subscriptionId: subscription.id, key: process.env.RAZORPAY_KEY_ID })
   } catch (err: any) {
@@ -475,29 +543,57 @@ app.post('/api/subscribe', async (req, res) => {
 
 // ── Verify payment & activate plan ─────────────────────────────────────────
 app.post('/api/verify-payment', async (req, res) => {
-  const decoded = getUserFromToken(req)
+  const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   if ((await getOrgContext(decoded.userId)).isMember)
     return res.status(403).json({ error: 'Billing is managed by your team owner' })
-  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature, planKey, billingCycle } = req.body
-  const body = razorpay_payment_id + '|' + razorpay_subscription_id
-  const expectedSignature = crypto
-    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
-    .update(body)
-    .digest('hex')
-  if (expectedSignature !== razorpay_signature) {
-    return res.status(400).json({ error: 'Payment verification failed' })
+  const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } = req.body
+  if (![razorpay_payment_id, razorpay_subscription_id, razorpay_signature].every(v => typeof v === 'string' && v))
+    return res.status(400).json({ error: 'Missing payment fields' })
+  try {
+    const body = razorpay_payment_id + '|' + razorpay_subscription_id
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
+      .update(body)
+      .digest('hex')
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Payment verification failed' })
+    }
+
+    // Ask Razorpay what was actually bought — never trust planKey/billingCycle from the client.
+    const sub: any = await razorpay.subscriptions.fetch(razorpay_subscription_id)
+    let planKey: string | null = null
+    let billingCycle: 'monthly' | 'yearly' | null = null
+    for (const [key, byCurrency] of Object.entries(PLAN_IDS)) {
+      for (const cur of ['INR', 'USD']) {
+        for (const cyc of ['monthly', 'yearly'] as const) {
+          const id = (byCurrency as any)[cur]?.[cyc]
+          if (id && id === sub.plan_id) { planKey = key; billingCycle = cyc }
+        }
+      }
+    }
+    if (!planKey || !billingCycle) return res.status(400).json({ error: 'Unknown plan for this subscription' })
+
+    // The subscription must belong to this user
+    if (sub.notes?.userId && String(sub.notes.userId) !== String(decoded.userId))
+      return res.status(403).json({ error: 'Subscription does not belong to this user' })
+    const takenByOther = await User.findOne({ razorpaySubscriptionId: razorpay_subscription_id, _id: { $ne: decoded.userId } })
+    if (takenByOther) return res.status(409).json({ error: 'Subscription already used' })
+
+    // Calculate expiry
+    const now = new Date()
+    const expiresAt: Date = billingCycle === 'yearly'
+      ? new Date(now.setFullYear(now.getFullYear() + 1))
+      : new Date(now.setMonth(now.getMonth() + 1))
+    await User.updateOne(
+      { _id: decoded.userId },
+      { $set: { plan: planKey, planExpiresAt: expiresAt, razorpaySubscriptionId: razorpay_subscription_id } }
+    )
+    res.json({ success: true, plan: planKey })
+  } catch (err) {
+    console.error('🔴 Verify payment error:', err)
+    res.status(500).json({ error: 'Could not verify payment' })
   }
-  // Calculate expiry
-  const now = new Date()
-  const expiresAt: Date = billingCycle === 'yearly'
-    ? new Date(now.setFullYear(now.getFullYear() + 1))
-    : new Date(now.setMonth(now.getMonth() + 1))
-  await User.updateOne(
-    { _id: decoded.userId },
-    { $set: { plan: planKey, planExpiresAt: expiresAt, razorpaySubscriptionId: razorpay_subscription_id } }
-  )
-  res.json({ success: true, plan: planKey })
 })
 
 // ── Create a one-time custom-amount payment order (NOT a subscription) ─────
@@ -505,7 +601,7 @@ app.post('/api/verify-payment', async (req, res) => {
 // amount. No plan/backend activation happens here or in the verify route
 // below — this exists purely to confirm the money reaches your bank account.
 app.post('/api/create-custom-order', async (req, res) => {
-  const decoded = getUserFromToken(req)
+  const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   if ((await getOrgContext(decoded.userId)).isMember)
     return res.status(403).json({ error: 'Billing is managed by your team owner' })
@@ -536,7 +632,7 @@ app.post('/api/create-custom-order', async (req, res) => {
 // HMAC_SHA256(order_id + "|" + payment_id, key_secret). No plan changes —
 // this route only confirms the payment is genuine and credits the user.
 app.post('/api/verify-custom-payment', async (req, res) => {
-  const decoded = getUserFromToken(req)
+  const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body
   if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -554,7 +650,13 @@ app.post('/api/verify-custom-payment', async (req, res) => {
   // Pull the order back from Razorpay — the source of truth for both the
   // legacy "credits" grant (via notes) and the real charged amount/currency
   // (via order.amount/order.currency). Neither is trusted from req.body.
-  const order = await razorpay.orders.fetch(razorpay_order_id)
+  let order: any
+  try {
+    order = await razorpay.orders.fetch(razorpay_order_id)
+  } catch (err) {
+    console.error('Razorpay order fetch error:', err)
+    return res.status(400).json({ success: false, error: 'Could not verify order' })
+  }
   const orderUserId = order.notes?.userId
   const creditsToAdd = parseInt(String(order.notes?.credits || '0'), 10)
 
@@ -566,6 +668,24 @@ app.post('/api/verify-custom-payment', async (req, res) => {
   // INR, cents for USD) and the currency the order was actually created in.
   // customCreditsINR / customCreditsUSD are tracked separately and never
   // converted between each other — a ₹500 order adds ₹500, a $10 order adds $10.
+  // Replay protection: each payment can be credited exactly once.
+  try {
+    await ProcessedPayment.create({ paymentId: razorpay_payment_id, userId: String(decoded.userId) })
+  } catch (err: any) {
+    if (err?.code === 11000) {
+      const existing = await User.findById(decoded.userId)
+      return res.json({
+        success: true,
+        alreadyProcessed: true,
+        creditsAdded: 0,
+        customCreditsINR: existing?.customCreditsINR || 0,
+        customCreditsUSD: existing?.customCreditsUSD || 0
+      })
+    }
+    console.error('ProcessedPayment error:', err)
+    return res.status(500).json({ success: false, error: 'Could not record payment' })
+  }
+
   const chargedAmount = Number(order.amount) / 100
   const chargedCurrency = order.currency === 'USD' ? 'USD' : 'INR'
   const balanceField = chargedCurrency === 'USD' ? 'customCreditsUSD' : 'customCreditsINR'
@@ -589,7 +709,7 @@ app.post('/api/verify-custom-payment', async (req, res) => {
 
 // ── AI usage gate ───────────────────────────────────────────────────────────
 app.post('/api/ai-usage', async (req, res) => {
-  const decoded = getUserFromToken(req)
+  const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   const caller = await User.findById(decoded.userId)
   if (!caller) return res.status(404).json({ error: 'User not found' })
@@ -615,17 +735,6 @@ app.post('/api/ai-usage', async (req, res) => {
     { $set: { aiUsageDate: today, aiUsageToday: usageCount + 1 } }
   )
   return res.json({ allowed: true, usageToday: usageCount + 1, limit })
-})
-
-// ── Razorpay webhook (optional but recommended) ─────────────────────────────
-app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (req, res) => {
-  const secret = process.env.RAZORPAY_KEY_SECRET!
-  const signature = req.headers['x-razorpay-signature'] as string
-  const body = req.body
-  const digest = crypto.createHmac('sha256', secret).update(body).digest('hex')
-  if (digest !== signature) return res.status(400).json({ error: 'Invalid signature' })
-  // You can handle subscription cancellation/renewal here later
-  res.json({ received: true })
 })
 
 const PORT = process.env.PORT || 4000
