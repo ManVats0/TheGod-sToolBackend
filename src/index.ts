@@ -140,7 +140,25 @@ async function getOrgContext(userId: string): Promise<{ ownerId: string; isMembe
   const fallback = { ownerId: self, isMember: false, orgUserIds: [self] }
   const db = mongoose.connection.db
   if (!db) return fallback
-  const membership = await db.collection('org_members').findOne({ userId: self, status: 'active' })
+  // A person can belong to several workspaces (their own + invited teams). main.py stores which one
+  // they are working in (org_prefs); without a stored choice we use their own personal workspace.
+  let membership: any = null
+  const pref = await db.collection('org_prefs').findOne({ userId: self })
+  if (pref?.activeOrgId) {
+    membership = await db.collection('org_members').findOne({ userId: self, orgId: pref.activeOrgId, status: 'active' })
+  }
+  if (!membership) {
+    const all = await db.collection('org_members').find({ userId: self, status: 'active' }).toArray()
+    if (all.length === 1) {
+      membership = all[0]
+    } else if (all.length > 1) {
+      const orgs = await db.collection('organizations').find({ _id: { $in: all.map((m: any) => m.orgId) } }).toArray()
+      const personal = new Set(
+        orgs.filter((o: any) => String(o.slug || '').startsWith('personal-') && String(o.ownerId) === self).map((o: any) => String(o._id))
+      )
+      membership = all.find((m: any) => personal.has(String(m.orgId))) || all[0]
+    }
+  }
   if (!membership) return fallback
   const org = await db.collection('organizations').findOne({ _id: membership.orgId })
   const ownerId = String(org?.ownerId || self)
