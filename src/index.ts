@@ -10,6 +10,8 @@ import User from './User'
 // import Organization from './Organization' // NEW
 import { OAuth2Client } from 'google-auth-library'
 import rateLimit from 'express-rate-limit'
+import { Payment, CreditLedger } from './Payment'
+import { creditsForAmount, creditRates, creditLimits, recordPayment, logCredit, sendReceiptEmail, publicPayment, money } from './billing'
 
 dotenv.config()
 
@@ -20,7 +22,7 @@ app.use(cors({ origin: '*' }))
 // ── Razorpay webhook ────────────────────────────────────────────────────────
 // Must be registered BEFORE express.json(): signature verification needs the raw body.
 // Uses its own secret (Razorpay Dashboard → Webhooks → secret), NOT the API key secret.
-app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET
   if (!secret) return res.status(503).json({ error: 'Webhook not configured' })
   const signature = String(req.headers['x-razorpay-signature'] || '')
@@ -30,7 +32,14 @@ app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), (re
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
     return res.status(400).json({ error: 'Invalid signature' })
   }
-  // You can handle subscription cancellation/renewal here later
+  let event: any
+  try { event = JSON.parse(Buffer.from(req.body).toString('utf8')) } catch { return res.status(400).json({ error: 'Bad payload' }) }
+  try {
+    await handleRazorpayEvent(event)
+  } catch (err) {
+    console.error('Webhook processing failed:', err)
+    return res.status(500).json({ error: 'Webhook processing failed' }) // Razorpay retries on non-2xx
+  }
   res.json({ received: true })
 })
 
@@ -123,9 +132,7 @@ const AI_LIMITS: Record<string, number> = {
   enterprise: 500
 }
 
-// Rupees per credit for custom top-up payments — priced above your best
-// subscription rate (Pro: ~₹1.02/transform) so plans stay the better deal.
-const RUPEES_PER_CREDIT = 2
+// Credit pricing (rupees / dollars per credit, min and max top-up) lives in billing.ts.
 
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -536,6 +543,31 @@ app.get('/api/plan', async (req, res) => {
     await user.save()
   }
 
+  // Optional: end a paid plan once its paid period (+3 days grace) is over. OFF by default, because plans
+  // activated before renewals were recorded carry stale expiry dates. Switch on with ENFORCE_PLAN_EXPIRY=1
+  // after the webhook has been live for a full billing cycle.
+  if (process.env.ENFORCE_PLAN_EXPIRY === '1' && user.plan !== 'none' && user.plan !== 'trial' &&
+      user.planExpiresAt && user.planExpiresAt.getTime() + 3 * 24 * 60 * 60 * 1000 < Date.now()) {
+    user.plan = 'none'
+    user.planExpiresAt = null
+    await user.save()
+  }
+
+  // One-time: before credits could be spent, dollar top-ups only raised a money balance and gave no credits.
+  // Convert those balances to credits so past USD payers get what they paid for.
+  if ((user.customCreditsUSD || 0) > 0 && !user.usdCreditsMigrated) {
+    const add = creditsForAmount(user.customCreditsUSD || 0, 'USD')
+    const migrated: any = await User.findOneAndUpdate(
+      { _id: user._id, usdCreditsMigrated: { $ne: true } },
+      { $inc: { credits: add }, $set: { usdCreditsMigrated: true } },
+      { new: true }
+    )
+    if (migrated) {
+      user.credits = migrated.credits
+      await logCredit(String(user._id), add, 'usd_migration', migrated.credits || 0, null)
+    }
+  }
+
   res.json({
     plan: isAdminEmail(caller.email) ? 'enterprise' : user.plan,
     planExpiresAt: user.planExpiresAt,
@@ -544,9 +576,145 @@ app.get('/api/plan', async (req, res) => {
     name: caller.name || null,
     credits: user.credits || 0,
     customCreditsINR: user.customCreditsINR || 0,
-    customCreditsUSD: user.customCreditsUSD || 0
+    customCreditsUSD: user.customCreditsUSD || 0,
+    creditRates: creditRates()
   })
 })
+
+// ── Payment processing shared by the browser callback AND the Razorpay webhook ──────────────
+// Either one may arrive first (or only one, if the customer closes the tab right after paying), so every step
+// here is idempotent: a payment is credited / activated once and gets exactly one receipt.
+
+function planFromRazorpayPlanId(planId: string): { planKey: string; billingCycle: 'monthly' | 'yearly' } | null {
+  for (const [key, byCurrency] of Object.entries(PLAN_IDS)) {
+    for (const cur of ['INR', 'USD']) {
+      for (const cyc of ['monthly', 'yearly'] as const) {
+        const id = (byCurrency as any)[cur]?.[cyc]
+        if (id && id === planId) return { planKey: key, billingCycle: cyc }
+      }
+    }
+  }
+  return null
+}
+
+async function applyCustomPayment(userId: string, order: any, paymentId: string) {
+  const chargedAmount = Number(order.amount) / 100
+  const chargedCurrency: 'INR' | 'USD' = order.currency === 'USD' ? 'USD' : 'INR'
+  const balanceField = chargedCurrency === 'USD' ? 'customCreditsUSD' : 'customCreditsINR'
+  // Credits are always worked out from what Razorpay says was charged, never from the browser.
+  const creditsToAdd = creditsForAmount(chargedAmount, chargedCurrency)
+
+  // Replay protection: each payment can be credited exactly once.
+  try {
+    await ProcessedPayment.create({ paymentId, userId })
+  } catch (err: any) {
+    if (err?.code === 11000) {
+      const existingUser: any = await User.findById(userId)
+      let existingPayment: any = null
+      try { existingPayment = await Payment.findOne({ razorpayPaymentId: paymentId }) } catch { existingPayment = null }
+      return {
+        ok: true as const, alreadyProcessed: true, creditsAdded: 0,
+        user: existingUser, payment: existingPayment ? publicPayment(existingPayment) : null
+      }
+    }
+    throw err
+  }
+
+  let updatedUser: any
+  try {
+    updatedUser = await User.findOneAndUpdate(
+      { _id: userId },
+      { $inc: { [balanceField]: chargedAmount, credits: creditsToAdd } },
+      { new: true }
+    )
+  } catch (err) {
+    // Crediting failed: undo the "processed" marker so a retry can succeed and the customer is not charged for nothing.
+    console.error('Credit update failed, rolling back payment marker:', err)
+    await ProcessedPayment.deleteOne({ paymentId }).catch(() => {})
+    throw err
+  }
+  if (!updatedUser) {
+    await ProcessedPayment.deleteOne({ paymentId }).catch(() => {})
+    throw new Error('User not found while crediting payment ' + paymentId)
+  }
+  await logCredit(userId, creditsToAdd, 'purchase', updatedUser.credits || 0, paymentId)
+
+  // Receipt (never allowed to undo a successful credit)
+  let payment: any = null
+  try {
+    const rec = await recordPayment({
+      userId, kind: 'credits', amount: chargedAmount, currency: chargedCurrency,
+      credits: creditsToAdd, balanceAfter: updatedUser.credits || 0,
+      razorpayOrderId: order.id, razorpayPaymentId: paymentId,
+      customerEmail: updatedUser.email, customerName: updatedUser.name
+    })
+    payment = rec.payment
+    if (rec.created) await sendReceiptEmail(payment)
+  } catch (err) {
+    console.error('Could not record receipt for payment', paymentId, err)
+  }
+  return {
+    ok: true as const, alreadyProcessed: false, creditsAdded: creditsToAdd,
+    user: updatedUser, payment: payment ? publicPayment(payment) : null
+  }
+}
+
+async function applySubscriptionPayment(sub: any, rpPayment: any, forceUserId?: string) {
+  const found = planFromRazorpayPlanId(sub?.plan_id)
+  if (!found) { console.error('Subscription payment for an unknown plan id:', sub?.plan_id); return null }
+  let userId = forceUserId || String(sub.notes?.userId || '')
+  if (!userId) {
+    const byId: any = await User.findOne({ razorpaySubscriptionId: sub.id })
+    if (byId) userId = String(byId._id)
+  }
+  if (!userId) { console.error('Subscription payment with no matching user:', sub?.id); return null }
+
+  // Access is paid up to the end of the period Razorpay just charged for.
+  let periodEnd: Date | null = sub.current_end ? new Date(Number(sub.current_end) * 1000) : null
+  if (!periodEnd || periodEnd.getTime() <= Date.now()) {
+    const now = new Date()
+    periodEnd = found.billingCycle === 'yearly'
+      ? new Date(now.setFullYear(now.getFullYear() + 1))
+      : new Date(now.setMonth(now.getMonth() + 1))
+  }
+  await User.updateOne(
+    { _id: userId },
+    { $set: { plan: found.planKey, planExpiresAt: periodEnd, razorpaySubscriptionId: sub.id } }
+  )
+
+  if (!rpPayment?.id || !(Number(rpPayment.amount) > 0)) return { payment: null }
+  try {
+    const user: any = await User.findById(userId)
+    const rec = await recordPayment({
+      userId, kind: 'subscription', amount: Number(rpPayment.amount) / 100,
+      currency: rpPayment.currency === 'USD' ? 'USD' : 'INR',
+      planKey: found.planKey, billingCycle: found.billingCycle, periodEnd,
+      razorpayPaymentId: rpPayment.id, razorpaySubscriptionId: sub.id,
+      customerEmail: user?.email, customerName: user?.name
+    })
+    if (rec.created) await sendReceiptEmail(rec.payment)
+    return { payment: publicPayment(rec.payment) }
+  } catch (err) {
+    console.error('Could not record subscription receipt for payment', rpPayment.id, err)
+    return { payment: null }
+  }
+}
+
+async function handleRazorpayEvent(event: any) {
+  const type = event?.event
+  if (type === 'order.paid') {
+    const order = event.payload?.order?.entity
+    const payment = event.payload?.payment?.entity
+    if (order?.notes?.type === 'custom_payment' && order.notes.userId && payment?.id) {
+      await applyCustomPayment(String(order.notes.userId), order, String(payment.id))
+    }
+  } else if (type === 'subscription.charged') {
+    const sub = event.payload?.subscription?.entity
+    const payment = event.payload?.payment?.entity
+    if (sub?.id && payment?.id) await applySubscriptionPayment(sub, payment)
+  }
+  // subscription.cancelled / halted / completed need no action: access simply runs to the end of the paid period.
+}
 
 // ── Create Razorpay subscription ────────────────────────────────────────────
 app.post('/api/subscribe', async (req, res) => {
@@ -594,19 +762,12 @@ app.post('/api/verify-payment', async (req, res) => {
       return res.status(400).json({ error: 'Payment verification failed' })
     }
 
-    // Ask Razorpay what was actually bought — never trust planKey/billingCycle from the client.
+    // Ask Razorpay what was actually bought ? never trust planKey/billingCycle from the client.
     const sub: any = await razorpay.subscriptions.fetch(razorpay_subscription_id)
-    let planKey: string | null = null
-    let billingCycle: 'monthly' | 'yearly' | null = null
-    for (const [key, byCurrency] of Object.entries(PLAN_IDS)) {
-      for (const cur of ['INR', 'USD']) {
-        for (const cyc of ['monthly', 'yearly'] as const) {
-          const id = (byCurrency as any)[cur]?.[cyc]
-          if (id && id === sub.plan_id) { planKey = key; billingCycle = cyc }
-        }
-      }
-    }
-    if (!planKey || !billingCycle) return res.status(400).json({ error: 'Unknown plan for this subscription' })
+    if (!sub.id) sub.id = razorpay_subscription_id
+    const found = planFromRazorpayPlanId(sub.plan_id)
+    if (!found) return res.status(400).json({ error: 'Unknown plan for this subscription' })
+    const planKey = found.planKey
 
     // The subscription must belong to this user
     if (sub.notes?.userId && String(sub.notes.userId) !== String(decoded.userId))
@@ -614,16 +775,12 @@ app.post('/api/verify-payment', async (req, res) => {
     const takenByOther = await User.findOne({ razorpaySubscriptionId: razorpay_subscription_id, _id: { $ne: decoded.userId } })
     if (takenByOther) return res.status(409).json({ error: 'Subscription already used' })
 
-    // Calculate expiry
-    const now = new Date()
-    const expiresAt: Date = billingCycle === 'yearly'
-      ? new Date(now.setFullYear(now.getFullYear() + 1))
-      : new Date(now.setMonth(now.getMonth() + 1))
-    await User.updateOne(
-      { _id: decoded.userId },
-      { $set: { plan: planKey, planExpiresAt: expiresAt, razorpaySubscriptionId: razorpay_subscription_id } }
-    )
-    res.json({ success: true, plan: planKey })
+    // Activate the plan and record the receipt. The Razorpay webhook uses the same function, so whichever
+    // arrives first activates the customer and exactly one receipt is created.
+    let rpPayment: any = null
+    try { rpPayment = await razorpay.payments.fetch(razorpay_payment_id) } catch (e) { console.error('Could not fetch payment details for the receipt:', e) }
+    const result = await applySubscriptionPayment(sub, rpPayment || { id: razorpay_payment_id }, String(decoded.userId))
+    res.json({ success: true, plan: planKey, receiptId: result?.payment?.id ?? null, razorpayPaymentId: razorpay_payment_id })
   } catch (err) {
     console.error('🔴 Verify payment error:', err)
     res.status(500).json({ error: 'Could not verify payment' })
@@ -640,12 +797,19 @@ app.post('/api/create-custom-order', async (req, res) => {
   if ((await getOrgContext(decoded.userId)).isMember)
     return res.status(403).json({ error: 'Billing is managed by your team owner' })
   const { amount, currency } = req.body
-  const amountNum = Number(amount)
-  if (!amountNum || amountNum <= 0) {
+  const amountNum = Math.round(Number(amount) * 100) / 100
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
     return res.status(400).json({ error: 'Enter a valid amount greater than 0' })
   }
-  const selectedCurrency = currency === 'USD' ? 'USD' : 'INR'
-  const creditsToGrant = selectedCurrency === 'INR' ? Math.floor(amountNum / RUPEES_PER_CREDIT) : 0
+  const selectedCurrency: 'INR' | 'USD' = currency === 'USD' ? 'USD' : 'INR'
+  const limits = creditLimits(selectedCurrency)
+  if (amountNum < limits.min) {
+    return res.status(400).json({ error: `The minimum top-up is ${money(limits.min, selectedCurrency)}.` })
+  }
+  if (amountNum > limits.max) {
+    return res.status(400).json({ error: `The maximum single top-up is ${money(limits.max, selectedCurrency)}. For larger amounts, contact us.` })
+  }
+  const creditsToGrant = creditsForAmount(amountNum, selectedCurrency)
   try {
     const order = await razorpay.orders.create({
       amount: Math.round(amountNum * 100), // Razorpay wants the smallest unit (paise/cents)
@@ -692,64 +856,33 @@ app.post('/api/verify-custom-payment', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Could not verify order' })
   }
   const orderUserId = order.notes?.userId
-  const creditsToAdd = parseInt(String(order.notes?.credits || '0'), 10)
-
   if (orderUserId !== decoded.userId) {
     return res.status(403).json({ success: false, error: 'Order does not belong to this user' })
   }
 
-  // Razorpay confirms the amount in the smallest currency unit (paise for
-  // INR, cents for USD) and the currency the order was actually created in.
-  // customCreditsINR / customCreditsUSD are tracked separately and never
-  // converted between each other — a ₹500 order adds ₹500, a $10 order adds $10.
-  // Replay protection: each payment can be credited exactly once.
+  // Credits are worked out from Razorpay's own record of what was charged. The Razorpay webhook runs the same
+  // code, so a customer who closes the tab right after paying still gets their credits (exactly once).
   try {
-    await ProcessedPayment.create({ paymentId: razorpay_payment_id, userId: String(decoded.userId) })
-  } catch (err: any) {
-    if (err?.code === 11000) {
-      const existing = await User.findById(decoded.userId)
-      return res.json({
-        success: true,
-        alreadyProcessed: true,
-        creditsAdded: 0,
-        customCreditsINR: existing?.customCreditsINR || 0,
-        customCreditsUSD: existing?.customCreditsUSD || 0
-      })
-    }
-    console.error('ProcessedPayment error:', err)
-    return res.status(500).json({ success: false, error: 'Could not record payment' })
-  }
-
-  const chargedAmount = Number(order.amount) / 100
-  const chargedCurrency = order.currency === 'USD' ? 'USD' : 'INR'
-  const balanceField = chargedCurrency === 'USD' ? 'customCreditsUSD' : 'customCreditsINR'
-
-  const incUpdate: Record<string, number> = { [balanceField]: chargedAmount }
-  if (creditsToAdd > 0) incUpdate.credits = creditsToAdd
-
-  let updatedUser: any
-  try {
-    updatedUser = await User.findOneAndUpdate(
-      { _id: decoded.userId },
-      { $inc: incUpdate },
-      { new: true }
-    )
+    const r = await applyCustomPayment(String(decoded.userId), order, razorpay_payment_id)
+    res.json({
+      success: true,
+      alreadyProcessed: r.alreadyProcessed,
+      creditsAdded: r.creditsAdded,
+      credits: r.user?.credits || 0,
+      customCreditsINR: r.user?.customCreditsINR || 0,
+      customCreditsUSD: r.user?.customCreditsUSD || 0,
+      receiptId: r.payment?.id ?? null,
+      razorpayPaymentId: razorpay_payment_id
+    })
   } catch (err) {
-    // Crediting failed: undo the "processed" marker so the user can retry and is not charged for nothing.
-    console.error('🔴 Credit update failed, rolling back payment marker:', err)
-    await ProcessedPayment.deleteOne({ paymentId: razorpay_payment_id }).catch(() => {})
-    return res.status(500).json({ success: false, error: 'Could not credit payment. Please retry or contact support.' })
+    console.error('Custom payment processing failed:', err)
+    res.status(500).json({ success: false, error: 'Could not credit payment. Please retry or contact support.' })
   }
-
-  res.json({
-    success: true,
-    creditsAdded: creditsToAdd,
-    customCreditsINR: updatedUser?.customCreditsINR || 0,
-    customCreditsUSD: updatedUser?.customCreditsUSD || 0
-  })
 })
 
 // ── AI usage gate ───────────────────────────────────────────────────────────
+// Each AI action first uses the plan's daily allowance. When that is used up (or there is no plan at all),
+// it spends 1 purchased credit. Credits never expire and work with or without a subscription.
 app.post('/api/ai-usage', async (req, res) => {
   const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
@@ -759,24 +892,62 @@ app.post('/api/ai-usage', async (req, res) => {
   const user = (orgCtx.isMember ? await User.findById(orgCtx.ownerId) : caller) || caller
 
   const today = new Date().toISOString().slice(0, 10)
+  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : user.plan] || 0
 
-  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : user.plan]
+  // 1) The plan's daily allowance (atomic, so two simultaneous requests cannot both take the last slot)
+  if (limit > 0) {
+    let r: any = await User.updateOne({ _id: user._id, aiUsageDate: { $ne: today } }, { $set: { aiUsageDate: today, aiUsageToday: 1 } })
+    if (!r.modifiedCount) {
+      r = await User.updateOne({ _id: user._id, aiUsageDate: today, aiUsageToday: { $lt: limit } }, { $inc: { aiUsageToday: 1 } })
+    }
+    if (r.modifiedCount) {
+      const fresh: any = await User.findById(user._id)
+      return res.json({ allowed: true, source: 'plan', usageToday: fresh?.aiUsageToday ?? 1, limit, credits: fresh?.credits || 0 })
+    }
+  }
+
+  // 2) Purchased credits (atomic: only succeeds while at least 1 credit is left)
+  const spent: any = await User.findOneAndUpdate({ _id: user._id, credits: { $gte: 1 } }, { $inc: { credits: -1 } }, { new: true })
+  if (spent) {
+    await logCredit(String(user._id), -1, 'ai', spent.credits || 0, String(decoded.userId))
+    return res.json({ allowed: true, source: 'credits', limit, credits: spent.credits || 0 })
+  }
+
+  // 3) Nothing left
   if (!limit) {
-    return res.status(403).json({ error: 'no_plan', message: 'Upgrade to use AI features' })
+    return res.status(403).json({ error: 'no_plan', message: 'AI needs a plan or credits. Buy credits to pay only for what you use, no subscription needed.', credits: 0 })
   }
+  return res.status(429).json({ error: 'limit_reached', message: `You have used today's ${limit} AI actions. Buy credits to keep going now, or upgrade your plan.`, credits: 0 })
+})
 
-  const usageDate = user.aiUsageDate
-  const usageCount = usageDate === today ? (user.aiUsageToday || 0) : 0
+// ── Credit prices (public: the Pricing page shows a live "you get N credits" preview) ──
+app.get('/api/credit-rates', (_req, res) => {
+  res.json(creditRates())
+})
 
-  if (usageCount >= limit) {
-    return res.status(429).json({ error: 'limit_reached', message: `Daily AI limit reached (${limit}/day). Upgrade your plan for more.` })
-  }
+// ── Billing history & receipts (each person only ever sees their own) ─────────
+app.get('/api/payments', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const rows: any[] = await Payment.find({ userId: String(decoded.userId) }).sort({ createdAt: -1 }).limit(200).lean()
+  res.json(rows.map(publicPayment))
+})
 
-  await User.updateOne(
-    { _id: user._id },
-    { $set: { aiUsageDate: today, aiUsageToday: usageCount + 1 } }
-  )
-  return res.json({ allowed: true, usageToday: usageCount + 1, limit })
+app.get('/api/payments/by-razorpay/:paymentId', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const row: any = await Payment.findOne({ razorpayPaymentId: String(req.params.paymentId), userId: String(decoded.userId) })
+  if (!row) return res.status(404).json({ error: 'Receipt not found yet' })
+  res.json(publicPayment(row))
+})
+
+app.get('/api/payments/:id', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  let row: any = null
+  try { row = await Payment.findOne({ _id: String(req.params.id), userId: String(decoded.userId) }) } catch { row = null }
+  if (!row) return res.status(404).json({ error: 'Receipt not found' })
+  res.json(publicPayment(row))
 })
 
 const PORT = process.env.PORT || 4000

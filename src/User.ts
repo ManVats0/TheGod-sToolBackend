@@ -15,6 +15,7 @@ const userSchema = new mongoose.Schema({
   credits: { type: Number, default: 0 },
   customCreditsINR: { type: Number, default: 0 },
   customCreditsUSD: { type: Number, default: 0 },
+  usdCreditsMigrated: { type: Boolean, default: false },
   aiUsageToday: { type: Number, default: 0 },
   aiUsageDate: { type: String, default: null },
   sessions: {
