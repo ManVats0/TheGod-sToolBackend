@@ -581,6 +581,47 @@ app.get('/api/plan', async (req, res) => {
   })
 })
 
+// ── Dashboard summary: plan, credits, AI use and sign-ins for the landing page (read-only) ───
+app.get('/api/dashboard-summary', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const caller: any = await User.findById(decoded.userId)
+  if (!caller) return res.status(404).json({ error: 'User not found' })
+  const orgCtx = await getOrgContext(decoded.userId)
+  const owner: any = (orgCtx.isMember ? await User.findById(orgCtx.ownerId) : caller) || caller
+  const admin = isAdminEmail(caller.email)
+
+  const trialOver = owner.plan === 'trial' && !!owner.planExpiresAt && owner.planExpiresAt < new Date()
+  const plan = admin ? 'enterprise' : (trialOver ? 'none' : owner.plan)
+
+  // Sign-ins: counted across the whole workspace, exactly like the login limit itself.
+  const cutoff = Date.now() - SESSION_MAX_AGE_MS
+  const orgUsers: any[] = await User.find({ _id: { $in: orgCtx.orgUserIds } }, { sessions: 1 })
+  const live = (u: any) => (u.sessions || []).filter((s: any) => new Date(s.createdAt).getTime() >= cutoff)
+  const activeLogins = orgUsers.reduce((n, u) => n + live(u).length, 0)
+  const myDevices = live(caller).map((s: any) => ({ device: s.device || 'Unknown device', lastActive: s.lastActive || s.createdAt }))
+
+  const today = new Date().toISOString().slice(0, 10)
+  const aiLimit = AI_LIMITS[plan] || 0
+  const aiUsed = owner.aiUsageDate === today ? (owner.aiUsageToday || 0) : 0
+
+  const ledger = await CreditLedger.find({ userId: String(owner._id) }).sort({ createdAt: -1 }).limit(6).lean()
+  const daysLeft = owner.planExpiresAt ? Math.max(0, Math.ceil((new Date(owner.planExpiresAt).getTime() - Date.now()) / 86400000)) : null
+
+  res.json({
+    name: caller.name || null,
+    plan,
+    isTrial: plan === 'trial',
+    planExpiresAt: admin ? null : owner.planExpiresAt || null,
+    daysLeft: admin || plan === 'none' ? null : daysLeft,
+    isWorkspaceOwner: !orgCtx.isMember,
+    ai: { usedToday: aiUsed, limit: aiLimit },
+    credits: owner.credits || 0,
+    recentCredits: ledger.map((l: any) => ({ delta: l.delta, reason: l.reason, balanceAfter: l.balanceAfter, at: l.createdAt })),
+    logins: { active: activeLogins, limit: PLAN_SESSION_LIMITS[plan] || 1, mine: myDevices }
+  })
+})
+
 // ── Payment processing shared by the browser callback AND the Razorpay webhook ──────────────
 // Either one may arrive first (or only one, if the customer closes the tab right after paying), so every step
 // here is idempotent: a payment is credited / activated once and gets exactly one receipt.
