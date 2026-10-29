@@ -892,7 +892,9 @@ app.post('/api/ai-usage', async (req, res) => {
   const user = (orgCtx.isMember ? await User.findById(orgCtx.ownerId) : caller) || caller
 
   const today = new Date().toISOString().slice(0, 10)
-  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : user.plan] || 0
+  // A finished trial no longer carries the trial allowance, even if this person stayed logged in past day 14.
+  const trialOver = user.plan === 'trial' && !!user.planExpiresAt && user.planExpiresAt < new Date()
+  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : (trialOver ? 'none' : user.plan)] || 0
 
   // 1) The plan's daily allowance (atomic, so two simultaneous requests cannot both take the last slot)
   if (limit > 0) {
