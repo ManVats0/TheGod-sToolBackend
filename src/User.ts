@@ -1,3 +1,5 @@
+// User: one account. Plan, credits, trial and payment ids, and the signed-in devices (sessions) used for the login limit.
+
 import mongoose from 'mongoose'
 
 const userSchema = new mongoose.Schema({
@@ -19,14 +21,16 @@ const userSchema = new mongoose.Schema({
   aiUsageToday: { type: Number, default: 0 },
   aiUsageDate: { type: String, default: null },
   sessions: {
-    type: [{
-      sessionId: { type: String, required: true },
-      device: { type: String, default: 'Unknown device' },
-      createdAt: { type: Date, default: Date.now },
-      lastActive: { type: Date, default: Date.now }
-    }],
-    default: []
-  }
+    type: [
+      {
+        sessionId: { type: String, required: true },
+        device: { type: String, default: 'Unknown device' },
+        createdAt: { type: Date, default: Date.now },
+        lastActive: { type: Date, default: Date.now },
+      },
+    ],
+    default: [],
+  },
 })
 
 export default mongoose.model('User', userSchema)
