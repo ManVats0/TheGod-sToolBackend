@@ -4,7 +4,7 @@
 // Where things are (search for the "// ── " banners):
 //   Setup          Express, CORS, rate limits, MongoDB connection, Razorpay plan ids, plan limits
 //   Sign-in        email and Google login, password reset, logout (frees a device slot), organisation set-up
-//   Plan and use   plan info, dashboard summary, AI usage gate, credit prices
+//   Plan and use   plan info, dashboard summary, what's new (last seen date), AI usage gate, credit prices
 //   Payments       subscriptions, one-time credit top-ups, the Razorpay webhook, billing history and receipts
 // Settings come from environment variables, listed in README.md.
 
@@ -624,6 +624,28 @@ app.get('/api/plan', async (req, res) => {
     customCreditsUSD: user.customCreditsUSD || 0,
     creditRates: creditRates(),
   })
+})
+
+// ── What's new: when did this person last see the updates? (one date on the user, no extra storage) ───
+// GET says when. POST marks "seen now" and returns the previous date, so the app can show what changed since.
+app.get('/api/updates/seen', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const user: any = await User.findById(decoded.userId, { updatesSeenAt: 1 })
+  if (!user) return res.status(404).json({ error: 'User not found' })
+  res.json({ seenAt: user.updatesSeenAt ? new Date(user.updatesSeenAt).toISOString() : null })
+})
+
+app.post('/api/updates/seen', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const before: any = await User.findByIdAndUpdate(
+    decoded.userId,
+    { $set: { updatesSeenAt: new Date() } },
+    { projection: { updatesSeenAt: 1 } }
+  )
+  if (!before) return res.status(404).json({ error: 'User not found' })
+  res.json({ ok: true, previous: before.updatesSeenAt ? new Date(before.updatesSeenAt).toISOString() : null })
 })
 
 // ── Dashboard summary: plan, credits, AI use and sign-ins for the landing page (read-only) ───

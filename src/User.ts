@@ -20,6 +20,8 @@ const userSchema = new mongoose.Schema({
   usdCreditsMigrated: { type: Boolean, default: false },
   aiUsageToday: { type: Number, default: 0 },
   aiUsageDate: { type: String, default: null },
+  // When this person last saw the "What's new" updates. Empty until their first visit after this feature.
+  updatesSeenAt: { type: Date, default: null },
   sessions: {
     type: [
       {
