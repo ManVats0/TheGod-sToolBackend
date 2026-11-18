@@ -1,3 +1,5 @@
+// Organization: a workspace. Holds its owner and members with their roles. Created automatically on first sign-in.
+
 import mongoose, { Document, Model } from 'mongoose'
 
 export interface IOrgMember {
@@ -17,14 +19,16 @@ const organizationSchema = new mongoose.Schema<IOrganization>({
   name: { type: String, required: true, trim: true },
   ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   members: {
-    type: [{
-      userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-      role: { type: String, enum: ['owner', 'admin', 'editor', 'viewer'], required: true },
-      joinedAt: { type: Date, default: Date.now }
-    }],
-    default: []
+    type: [
+      {
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        role: { type: String, enum: ['owner', 'admin', 'editor', 'viewer'], required: true },
+        joinedAt: { type: Date, default: Date.now },
+      },
+    ],
+    default: [],
   },
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
 })
 
 const Organization: Model<IOrganization> = mongoose.model<IOrganization>('Organization', organizationSchema)

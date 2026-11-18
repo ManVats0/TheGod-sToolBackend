@@ -1,3 +1,13 @@
+// index.ts: the Node service of The God's Tool. It handles sign-in, accounts, plans and payments.
+// (Data work such as sources, cleaning and AI lives in the Python service.)
+//
+// Where things are (search for the "// ── " banners):
+//   Setup          Express, CORS, rate limits, MongoDB connection, Razorpay plan ids, plan limits
+//   Sign-in        email and Google login, password reset, logout (frees a device slot), organisation set-up
+//   Plan and use   plan info, dashboard summary, what's new (last seen date), AI usage gate, credit prices
+//   Payments       subscriptions, one-time credit top-ups, the Razorpay webhook, billing history and receipts
+// Settings come from environment variables, listed in README.md.
+
 import express from 'express'
 import mongoose from 'mongoose'
 import cors from 'cors'
@@ -11,7 +21,16 @@ import User from './User'
 import { OAuth2Client } from 'google-auth-library'
 import rateLimit from 'express-rate-limit'
 import { Payment, CreditLedger } from './Payment'
-import { creditsForAmount, creditRates, creditLimits, recordPayment, logCredit, sendReceiptEmail, publicPayment, money } from './billing'
+import {
+  creditsForAmount,
+  creditRates,
+  creditLimits,
+  recordPayment,
+  logCredit,
+  sendReceiptEmail,
+  publicPayment,
+  money,
+} from './billing'
 
 dotenv.config()
 
@@ -33,7 +52,11 @@ app.post('/api/webhook/razorpay', express.raw({ type: 'application/json' }), asy
     return res.status(400).json({ error: 'Invalid signature' })
   }
   let event: any
-  try { event = JSON.parse(Buffer.from(req.body).toString('utf8')) } catch { return res.status(400).json({ error: 'Bad payload' }) }
+  try {
+    event = JSON.parse(Buffer.from(req.body).toString('utf8'))
+  } catch {
+    return res.status(400).json({ error: 'Bad payload' })
+  }
   try {
     await handleRazorpayEvent(event)
   } catch (err) {
@@ -53,7 +76,7 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: true,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  message: { error: 'Too many attempts. Please try again in a few minutes.' }
+  message: { error: 'Too many attempts. Please try again in a few minutes.' },
 })
 app.use(['/api/login', '/api/register', '/api/reset-password', '/api/google'], authLimiter)
 
@@ -61,17 +84,18 @@ app.use(['/api/login', '/api/register', '/api/reset-password', '/api/google'], a
 const forgotLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 5,
-  keyGenerator: (req) => {
+  keyGenerator: req => {
     const e = (req.body as any)?.email
     return typeof e === 'string' && e ? 'email:' + e.toLowerCase().slice(0, 254) : 'ip:' + req.ip
   },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  message: { error: 'Too many reset requests. Please try again later.' }
+  message: { error: 'Too many reset requests. Please try again later.' },
 })
 app.use('/api/forgot-password', forgotLimiter)
 
-mongoose.connect(process.env.MONGODB_URI!)
+mongoose
+  .connect(process.env.MONGODB_URI!)
   .then(() => console.log('MongoDB connected'))
   .catch(err => console.error('MongoDB error:', err))
 
@@ -79,7 +103,7 @@ const JWT_SECRET = process.env.JWT_SECRET!
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID!,
-  key_secret: process.env.RAZORPAY_KEY_SECRET!
+  key_secret: process.env.RAZORPAY_KEY_SECRET!,
 })
 
 const googleOAuthClient = new OAuth2Client(
@@ -88,48 +112,61 @@ const googleOAuthClient = new OAuth2Client(
   process.env.GOOGLE_REDIRECT_URI!
 )
 
-const PLAN_IDS: Record<string, { INR: { monthly: string; yearly: string }; USD: { monthly: string; yearly: string } }> = {
-  lite: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_INR!,       yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_INR! },
-    USD: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_USD!,   yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_USD! }
-  },
-  starter: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_INR!,    yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_INR! },
-    USD: { monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_USD! }
-  },
-  pro: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_INR!,        yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_INR! },
-    USD: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_USD!,    yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_USD! }
-  },
-  team: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_INR!,       yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_INR! },
-    USD: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_USD!,   yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_USD! }
-  },
-  enterprise: {
-    INR: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_INR!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_INR! },
-    USD: { monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_USD! }
+const PLAN_IDS: Record<string, { INR: { monthly: string; yearly: string }; USD: { monthly: string; yearly: string } }> =
+  {
+    lite: {
+      INR: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_INR!, yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_INR! },
+      USD: { monthly: process.env.RAZORPAY_PLAN_LITE_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_LITE_YEARLY_USD! },
+    },
+    starter: {
+      INR: {
+        monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_INR!,
+        yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_INR!,
+      },
+      USD: {
+        monthly: process.env.RAZORPAY_PLAN_STARTER_MONTHLY_USD!,
+        yearly: process.env.RAZORPAY_PLAN_STARTER_YEARLY_USD!,
+      },
+    },
+    pro: {
+      INR: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_INR!, yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_INR! },
+      USD: { monthly: process.env.RAZORPAY_PLAN_PRO_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_PRO_YEARLY_USD! },
+    },
+    team: {
+      INR: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_INR!, yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_INR! },
+      USD: { monthly: process.env.RAZORPAY_PLAN_TEAM_MONTHLY_USD!, yearly: process.env.RAZORPAY_PLAN_TEAM_YEARLY_USD! },
+    },
+    enterprise: {
+      INR: {
+        monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_INR!,
+        yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_INR!,
+      },
+      USD: {
+        monthly: process.env.RAZORPAY_PLAN_ENTERPRISE_MONTHLY_USD!,
+        yearly: process.env.RAZORPAY_PLAN_ENTERPRISE_YEARLY_USD!,
+      },
+    },
   }
-}
 
 // Max concurrent logged-in sessions allowed per plan ("User Limit" column)
 const PLAN_SESSION_LIMITS: Record<string, number> = {
-  none:       1,
-  trial:      1,
-  lite:       1,
-  starter:    1,
-  pro:        5,
-  team:       15,
-  enterprise: 100
+  none: 1,
+  trial: 1,
+  lite: 1,
+  starter: 1,
+  pro: 5,
+  team: 15,
+  enterprise: 100,
 }
 
 // Daily AI transform limits per plan
 const AI_LIMITS: Record<string, number> = {
-  trial:      15,
-  lite:       4,
-  starter:    35,
-  pro:        110,
-  team:       150,
-  enterprise: 500
+  trial: 15,
+  lite: 4,
+  starter: 35,
+  pro: 110,
+  team: 150,
+  enterprise: 500,
 }
 
 // Credit pricing (rupees / dollars per credit, min and max top-up) lives in billing.ts.
@@ -137,7 +174,10 @@ const AI_LIMITS: Record<string, number> = {
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
 function isAdminEmail(email?: string | null): boolean {
-  const list = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
+  const list = (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+    .filter(Boolean)
   return !!email && list.includes(email.toLowerCase())
 }
 
@@ -159,9 +199,14 @@ async function getOrgContext(userId: string): Promise<{ ownerId: string; isMembe
     if (all.length === 1) {
       membership = all[0]
     } else if (all.length > 1) {
-      const orgs = await db.collection('organizations').find({ _id: { $in: all.map((m: any) => m.orgId) } }).toArray()
+      const orgs = await db
+        .collection('organizations')
+        .find({ _id: { $in: all.map((m: any) => m.orgId) } })
+        .toArray()
       const personal = new Set(
-        orgs.filter((o: any) => String(o.slug || '').startsWith('personal-') && String(o.ownerId) === self).map((o: any) => String(o._id))
+        orgs
+          .filter((o: any) => String(o.slug || '').startsWith('personal-') && String(o.ownerId) === self)
+          .map((o: any) => String(o._id))
       )
       membership = all.find((m: any) => personal.has(String(m.orgId))) || all[0]
     }
@@ -180,10 +225,9 @@ async function issueSessionAndToken(user: any, device: string): Promise<{ token?
   const orgCtx = await getOrgContext(String(user._id))
 
   // Purge expired (>7 days) sessions across the whole org first.
-  await User.updateMany(
-    { _id: { $in: orgCtx.orgUserIds } },
-    { $pull: { sessions: { createdAt: { $lt: new Date(Date.now() - SESSION_MAX_AGE_MS) } } } } as any
-  )
+  await User.updateMany({ _id: { $in: orgCtx.orgUserIds } }, {
+    $pull: { sessions: { createdAt: { $lt: new Date(Date.now() - SESSION_MAX_AGE_MS) } } },
+  } as any)
 
   if (!isAdminEmail(user.email)) {
     const ownerDoc = orgCtx.isMember ? await User.findById(orgCtx.ownerId) : user
@@ -191,7 +235,9 @@ async function issueSessionAndToken(user: any, device: string): Promise<{ token?
     const orgUsers = await User.find({ _id: { $in: orgCtx.orgUserIds } }, { sessions: 1 })
     const active = orgUsers.reduce((n: number, u: any) => n + (u.sessions?.length || 0), 0)
     if (active >= limit) {
-      return { error: `Login limit reached for your plan (max ${limit} device${limit > 1 ? 's' : ''} signed in at once across your team). Log out on another device or upgrade your plan.` }
+      return {
+        error: `Login limit reached for your plan (max ${limit} device${limit > 1 ? 's' : ''} signed in at once across your team). Log out on another device or upgrade your plan.`,
+      }
     }
   }
 
@@ -234,16 +280,21 @@ function getUserFromToken(req: express.Request): { userId: string; email: string
 }
 
 // One row per credited payment — prevents the same payment being credited twice (replay).
-const ProcessedPayment = mongoose.model('ProcessedPayment', new mongoose.Schema({
-  paymentId: { type: String, required: true, unique: true },
-  userId: { type: String },
-  createdAt: { type: Date, default: Date.now }
-}))
+const ProcessedPayment = mongoose.model(
+  'ProcessedPayment',
+  new mongoose.Schema({
+    paymentId: { type: String, required: true, unique: true },
+    userId: { type: String },
+    createdAt: { type: Date, default: Date.now },
+  })
+)
 
 // Like getUserFromToken, but also requires the session to still exist.
 // This makes logout / "log out other device" actually invalidate the token.
 // Tokens without a sessionId (very old ones) are still accepted.
-async function authenticate(req: express.Request): Promise<{ userId: string; email: string; sessionId?: string } | null> {
+async function authenticate(
+  req: express.Request
+): Promise<{ userId: string; email: string; sessionId?: string } | null> {
   const decoded = getUserFromToken(req)
   if (!decoded) return null
   if (decoded.sessionId) {
@@ -267,16 +318,14 @@ async function ensureOrganization(_user: any): Promise<void> {
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password } = req.body
-    if (!email || !password)
-      return res.status(400).json({ error: 'Email and password required' })
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' })
     if (!isEmail(email) || typeof password !== 'string')
       return res.status(400).json({ error: 'Enter a valid email address' })
     if (password.length < 8 || password.length > 128)
       return res.status(400).json({ error: 'Password must be 8–128 characters' })
 
     const exists = await User.findOne({ email })
-    if (exists)
-      return res.status(400).json({ error: 'Email already registered' })
+    if (exists) return res.status(400).json({ error: 'Email already registered' })
 
     const hashed = await bcrypt.hash(password, 10)
     const user = await User.create({ email, password: hashed })
@@ -293,18 +342,15 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body
-    if (!email || !password)
-      return res.status(400).json({ error: 'Email and password required' })
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' })
     if (typeof email !== 'string' || typeof password !== 'string')
       return res.status(400).json({ error: 'Invalid credentials' })
 
     const user = await User.findOne({ email })
-    if (!user || !user.password)
-      return res.status(400).json({ error: 'Invalid credentials' })
+    if (!user || !user.password) return res.status(400).json({ error: 'Invalid credentials' })
 
     const match = await bcrypt.compare(password, user.password)
-    if (!match)
-      return res.status(400).json({ error: 'Invalid credentials' })
+    if (!match) return res.status(400).json({ error: 'Invalid credentials' })
 
     if (req.body.forceLogout) {
       await evictOldestSession(user._id)
@@ -330,16 +376,14 @@ app.post('/api/google', async (req, res) => {
     try {
       const ticket = await googleOAuthClient.verifyIdToken({
         idToken: credential,
-        audience: process.env.GOOGLE_CLIENT_ID!
+        audience: process.env.GOOGLE_CLIENT_ID!,
       })
       payload = ticket.getPayload()
     } catch {
       return res.status(401).json({ error: 'Invalid Google credential' })
     }
-    if (!payload?.email || !payload?.sub)
-      return res.status(400).json({ error: 'Missing Google data' })
-    if (!payload.email_verified)
-      return res.status(400).json({ error: 'Your Google email is not verified' })
+    if (!payload?.email || !payload?.sub) return res.status(400).json({ error: 'Missing Google data' })
+    if (!payload.email_verified) return res.status(400).json({ error: 'Your Google email is not verified' })
 
     const user = await User.findOneAndUpdate(
       { email: payload.email },
@@ -347,8 +391,7 @@ app.post('/api/google', async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     )
 
-    if (!user)
-      return res.status(500).json({ error: 'Failed to create or update user' })
+    if (!user) return res.status(500).json({ error: 'Failed to create or update user' })
 
     if (forceLogout) {
       await evictOldestSession(user._id)
@@ -381,7 +424,7 @@ app.get('/api/google/callback', async (req, res) => {
 
     const ticket = await googleOAuthClient.verifyIdToken({
       idToken,
-      audience: process.env.GOOGLE_CLIENT_ID!
+      audience: process.env.GOOGLE_CLIENT_ID!,
     })
     const payload = ticket.getPayload()
     if (!payload?.email || !payload?.sub || !payload.email_verified) {
@@ -429,7 +472,7 @@ app.post('/api/forgot-password', async (req, res) => {
     const resend = new Resend(process.env.RESEND_API_KEY)
 
     await resend.emails.send({
-      from: "The Gods Tool <noreply@thegodstool.com>",
+      from: 'The Gods Tool <noreply@thegodstool.com>',
       to: email,
       subject: 'Password Reset Link',
       html: `
@@ -439,7 +482,7 @@ app.post('/api/forgot-password', async (req, res) => {
           <a href="${resetLink}" style="display:inline-block;margin-top:16px;padding:12px 28px;background:linear-gradient(135deg,#7c3aed,#4f46e5);color:white;border-radius:6px;text-decoration:none;font-weight:700;">Reset Password</a>
           <p style="margin-top:24px;color:#475569;font-size:0.8rem;">If you didn't request this, ignore this email.</p>
         </div>
-      `
+      `,
     })
 
     res.json({ message: 'Reset link sent' })
@@ -460,7 +503,7 @@ app.post('/api/reset-password', async (req, res) => {
 
     const user = await User.findOne({
       resetToken: hashToken(token),
-      resetTokenExpiry: { $gt: new Date() }
+      resetTokenExpiry: { $gt: new Date() },
     })
 
     if (!user) return res.status(400).json({ error: 'Invalid or expired reset link' })
@@ -484,10 +527,7 @@ app.get('/api/health', (_, res) => res.json({ status: 'ok' }))
 app.post('/api/logout', async (req, res) => {
   const decoded = getUserFromToken(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  await User.updateOne(
-    { _id: decoded.userId },
-    { $pull: { sessions: { sessionId: decoded.sessionId } } }
-  )
+  await User.updateOne({ _id: decoded.userId }, { $pull: { sessions: { sessionId: decoded.sessionId } } })
   res.json({ success: true })
 })
 
@@ -500,9 +540,9 @@ app.post('/api/save-alert-email', async (req, res) => {
     const resend = new Resend(process.env.RESEND_API_KEY)
 
     await resend.emails.send({
-      from: "The Gods Tool <noreply@thegodstool.com>",
+      from: 'The Gods Tool <noreply@thegodstool.com>',
       to: email,
-      subject: 'Data Alerts Activated — The God\'s Tool',
+      subject: "Data Alerts Activated — The God's Tool",
       html: `
         <div style="font-family:Georgia,serif;background:#05080f;color:#e2e8f0;padding:32px;border-radius:8px;">
           <h2 style="color:#a78bfa;">The God's Tool</h2>
@@ -516,7 +556,7 @@ app.post('/api/save-alert-email', async (req, res) => {
           </ul>
           <p style="margin-top:24px;color:#475569;font-size:0.8rem;">If you didn't set this up, ignore this email.</p>
         </div>
-      `
+      `,
     })
 
     res.json({ success: true })
@@ -546,8 +586,13 @@ app.get('/api/plan', async (req, res) => {
   // Optional: end a paid plan once its paid period (+3 days grace) is over. OFF by default, because plans
   // activated before renewals were recorded carry stale expiry dates. Switch on with ENFORCE_PLAN_EXPIRY=1
   // after the webhook has been live for a full billing cycle.
-  if (process.env.ENFORCE_PLAN_EXPIRY === '1' && user.plan !== 'none' && user.plan !== 'trial' &&
-      user.planExpiresAt && user.planExpiresAt.getTime() + 3 * 24 * 60 * 60 * 1000 < Date.now()) {
+  if (
+    process.env.ENFORCE_PLAN_EXPIRY === '1' &&
+    user.plan !== 'none' &&
+    user.plan !== 'trial' &&
+    user.planExpiresAt &&
+    user.planExpiresAt.getTime() + 3 * 24 * 60 * 60 * 1000 < Date.now()
+  ) {
     user.plan = 'none'
     user.planExpiresAt = null
     await user.save()
@@ -577,8 +622,30 @@ app.get('/api/plan', async (req, res) => {
     credits: user.credits || 0,
     customCreditsINR: user.customCreditsINR || 0,
     customCreditsUSD: user.customCreditsUSD || 0,
-    creditRates: creditRates()
+    creditRates: creditRates(),
   })
+})
+
+// ── What's new: when did this person last see the updates? (one date on the user, no extra storage) ───
+// GET says when. POST marks "seen now" and returns the previous date, so the app can show what changed since.
+app.get('/api/updates/seen', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const user: any = await User.findById(decoded.userId, { updatesSeenAt: 1 })
+  if (!user) return res.status(404).json({ error: 'User not found' })
+  res.json({ seenAt: user.updatesSeenAt ? new Date(user.updatesSeenAt).toISOString() : null })
+})
+
+app.post('/api/updates/seen', async (req, res) => {
+  const decoded = await authenticate(req)
+  if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
+  const before: any = await User.findByIdAndUpdate(
+    decoded.userId,
+    { $set: { updatesSeenAt: new Date() } },
+    { projection: { updatesSeenAt: 1 } }
+  )
+  if (!before) return res.status(404).json({ error: 'User not found' })
+  res.json({ ok: true, previous: before.updatesSeenAt ? new Date(before.updatesSeenAt).toISOString() : null })
 })
 
 // ── Dashboard summary: plan, credits, AI use and sign-ins for the landing page (read-only) ───
@@ -592,21 +659,29 @@ app.get('/api/dashboard-summary', async (req, res) => {
   const admin = isAdminEmail(caller.email)
 
   const trialOver = owner.plan === 'trial' && !!owner.planExpiresAt && owner.planExpiresAt < new Date()
-  const plan = admin ? 'enterprise' : (trialOver ? 'none' : owner.plan)
+  const plan = admin ? 'enterprise' : trialOver ? 'none' : owner.plan
 
   // Sign-ins: counted across the whole workspace, exactly like the login limit itself.
   const cutoff = Date.now() - SESSION_MAX_AGE_MS
   const orgUsers: any[] = await User.find({ _id: { $in: orgCtx.orgUserIds } }, { sessions: 1 })
   const live = (u: any) => (u.sessions || []).filter((s: any) => new Date(s.createdAt).getTime() >= cutoff)
   const activeLogins = orgUsers.reduce((n, u) => n + live(u).length, 0)
-  const myDevices = live(caller).map((s: any) => ({ device: s.device || 'Unknown device', lastActive: s.lastActive || s.createdAt }))
+  const myDevices = live(caller).map((s: any) => ({
+    device: s.device || 'Unknown device',
+    lastActive: s.lastActive || s.createdAt,
+  }))
 
   const today = new Date().toISOString().slice(0, 10)
   const aiLimit = AI_LIMITS[plan] || 0
-  const aiUsed = owner.aiUsageDate === today ? (owner.aiUsageToday || 0) : 0
+  const aiUsed = owner.aiUsageDate === today ? owner.aiUsageToday || 0 : 0
 
-  const ledger = await CreditLedger.find({ userId: String(owner._id) }).sort({ createdAt: -1 }).limit(6).lean()
-  const daysLeft = owner.planExpiresAt ? Math.max(0, Math.ceil((new Date(owner.planExpiresAt).getTime() - Date.now()) / 86400000)) : null
+  const ledger = await CreditLedger.find({ userId: String(owner._id) })
+    .sort({ createdAt: -1 })
+    .limit(6)
+    .lean()
+  const daysLeft = owner.planExpiresAt
+    ? Math.max(0, Math.ceil((new Date(owner.planExpiresAt).getTime() - Date.now()) / 86400000))
+    : null
 
   res.json({
     name: caller.name || null,
@@ -617,8 +692,13 @@ app.get('/api/dashboard-summary', async (req, res) => {
     isWorkspaceOwner: !orgCtx.isMember,
     ai: { usedToday: aiUsed, limit: aiLimit },
     credits: owner.credits || 0,
-    recentCredits: ledger.map((l: any) => ({ delta: l.delta, reason: l.reason, balanceAfter: l.balanceAfter, at: l.createdAt })),
-    logins: { active: activeLogins, limit: PLAN_SESSION_LIMITS[plan] || 1, mine: myDevices }
+    recentCredits: ledger.map((l: any) => ({
+      delta: l.delta,
+      reason: l.reason,
+      balanceAfter: l.balanceAfter,
+      at: l.createdAt,
+    })),
+    logins: { active: activeLogins, limit: PLAN_SESSION_LIMITS[plan] || 1, mine: myDevices },
   })
 })
 
@@ -652,10 +732,17 @@ async function applyCustomPayment(userId: string, order: any, paymentId: string)
     if (err?.code === 11000) {
       const existingUser: any = await User.findById(userId)
       let existingPayment: any = null
-      try { existingPayment = await Payment.findOne({ razorpayPaymentId: paymentId }) } catch { existingPayment = null }
+      try {
+        existingPayment = await Payment.findOne({ razorpayPaymentId: paymentId })
+      } catch {
+        existingPayment = null
+      }
       return {
-        ok: true as const, alreadyProcessed: true, creditsAdded: 0,
-        user: existingUser, payment: existingPayment ? publicPayment(existingPayment) : null
+        ok: true as const,
+        alreadyProcessed: true,
+        creditsAdded: 0,
+        user: existingUser,
+        payment: existingPayment ? publicPayment(existingPayment) : null,
       }
     }
     throw err
@@ -684,10 +771,16 @@ async function applyCustomPayment(userId: string, order: any, paymentId: string)
   let payment: any = null
   try {
     const rec = await recordPayment({
-      userId, kind: 'credits', amount: chargedAmount, currency: chargedCurrency,
-      credits: creditsToAdd, balanceAfter: updatedUser.credits || 0,
-      razorpayOrderId: order.id, razorpayPaymentId: paymentId,
-      customerEmail: updatedUser.email, customerName: updatedUser.name
+      userId,
+      kind: 'credits',
+      amount: chargedAmount,
+      currency: chargedCurrency,
+      credits: creditsToAdd,
+      balanceAfter: updatedUser.credits || 0,
+      razorpayOrderId: order.id,
+      razorpayPaymentId: paymentId,
+      customerEmail: updatedUser.email,
+      customerName: updatedUser.name,
     })
     payment = rec.payment
     if (rec.created) await sendReceiptEmail(payment)
@@ -695,28 +788,38 @@ async function applyCustomPayment(userId: string, order: any, paymentId: string)
     console.error('Could not record receipt for payment', paymentId, err)
   }
   return {
-    ok: true as const, alreadyProcessed: false, creditsAdded: creditsToAdd,
-    user: updatedUser, payment: payment ? publicPayment(payment) : null
+    ok: true as const,
+    alreadyProcessed: false,
+    creditsAdded: creditsToAdd,
+    user: updatedUser,
+    payment: payment ? publicPayment(payment) : null,
   }
 }
 
 async function applySubscriptionPayment(sub: any, rpPayment: any, forceUserId?: string) {
   const found = planFromRazorpayPlanId(sub?.plan_id)
-  if (!found) { console.error('Subscription payment for an unknown plan id:', sub?.plan_id); return null }
+  if (!found) {
+    console.error('Subscription payment for an unknown plan id:', sub?.plan_id)
+    return null
+  }
   let userId = forceUserId || String(sub.notes?.userId || '')
   if (!userId) {
     const byId: any = await User.findOne({ razorpaySubscriptionId: sub.id })
     if (byId) userId = String(byId._id)
   }
-  if (!userId) { console.error('Subscription payment with no matching user:', sub?.id); return null }
+  if (!userId) {
+    console.error('Subscription payment with no matching user:', sub?.id)
+    return null
+  }
 
   // Access is paid up to the end of the period Razorpay just charged for.
   let periodEnd: Date | null = sub.current_end ? new Date(Number(sub.current_end) * 1000) : null
   if (!periodEnd || periodEnd.getTime() <= Date.now()) {
     const now = new Date()
-    periodEnd = found.billingCycle === 'yearly'
-      ? new Date(now.setFullYear(now.getFullYear() + 1))
-      : new Date(now.setMonth(now.getMonth() + 1))
+    periodEnd =
+      found.billingCycle === 'yearly'
+        ? new Date(now.setFullYear(now.getFullYear() + 1))
+        : new Date(now.setMonth(now.getMonth() + 1))
   }
   await User.updateOne(
     { _id: userId },
@@ -727,11 +830,17 @@ async function applySubscriptionPayment(sub: any, rpPayment: any, forceUserId?: 
   try {
     const user: any = await User.findById(userId)
     const rec = await recordPayment({
-      userId, kind: 'subscription', amount: Number(rpPayment.amount) / 100,
+      userId,
+      kind: 'subscription',
+      amount: Number(rpPayment.amount) / 100,
       currency: rpPayment.currency === 'USD' ? 'USD' : 'INR',
-      planKey: found.planKey, billingCycle: found.billingCycle, periodEnd,
-      razorpayPaymentId: rpPayment.id, razorpaySubscriptionId: sub.id,
-      customerEmail: user?.email, customerName: user?.name
+      planKey: found.planKey,
+      billingCycle: found.billingCycle,
+      periodEnd,
+      razorpayPaymentId: rpPayment.id,
+      razorpaySubscriptionId: sub.id,
+      customerEmail: user?.email,
+      customerName: user?.name,
     })
     if (rec.created) await sendReceiptEmail(rec.payment)
     return { payment: publicPayment(rec.payment) }
@@ -765,7 +874,8 @@ app.post('/api/subscribe', async (req, res) => {
     return res.status(403).json({ error: 'Billing is managed by your team owner' })
   const { planKey, billingCycle, currency } = req.body
   if (!PLAN_IDS[planKey]) return res.status(400).json({ error: 'Invalid plan' })
-  if (billingCycle !== 'monthly' && billingCycle !== 'yearly') return res.status(400).json({ error: 'Invalid billing cycle' })
+  if (billingCycle !== 'monthly' && billingCycle !== 'yearly')
+    return res.status(400).json({ error: 'Invalid billing cycle' })
   const selectedCurrency = currency === 'USD' ? 'USD' : 'INR'
   const razorpayPlanId = PLAN_IDS[planKey][selectedCurrency][billingCycle]
   if (!razorpayPlanId) return res.status(400).json({ error: 'Plan not available for this currency' })
@@ -775,7 +885,7 @@ app.post('/api/subscribe', async (req, res) => {
       customer_notify: 1,
       quantity: 1,
       total_count: billingCycle === 'yearly' ? 1 : 12,
-      notes: { userId: String(decoded.userId) }
+      notes: { userId: String(decoded.userId) },
     })
     res.json({ subscriptionId: subscription.id, key: process.env.RAZORPAY_KEY_ID })
   } catch (err: any) {
@@ -795,10 +905,7 @@ app.post('/api/verify-payment', async (req, res) => {
     return res.status(400).json({ error: 'Missing payment fields' })
   try {
     const body = razorpay_payment_id + '|' + razorpay_subscription_id
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
-      .update(body)
-      .digest('hex')
+    const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!).update(body).digest('hex')
     if (expectedSignature !== razorpay_signature) {
       return res.status(400).json({ error: 'Payment verification failed' })
     }
@@ -813,15 +920,27 @@ app.post('/api/verify-payment', async (req, res) => {
     // The subscription must belong to this user
     if (sub.notes?.userId && String(sub.notes.userId) !== String(decoded.userId))
       return res.status(403).json({ error: 'Subscription does not belong to this user' })
-    const takenByOther = await User.findOne({ razorpaySubscriptionId: razorpay_subscription_id, _id: { $ne: decoded.userId } })
+    const takenByOther = await User.findOne({
+      razorpaySubscriptionId: razorpay_subscription_id,
+      _id: { $ne: decoded.userId },
+    })
     if (takenByOther) return res.status(409).json({ error: 'Subscription already used' })
 
     // Activate the plan and record the receipt. The Razorpay webhook uses the same function, so whichever
     // arrives first activates the customer and exactly one receipt is created.
     let rpPayment: any = null
-    try { rpPayment = await razorpay.payments.fetch(razorpay_payment_id) } catch (e) { console.error('Could not fetch payment details for the receipt:', e) }
+    try {
+      rpPayment = await razorpay.payments.fetch(razorpay_payment_id)
+    } catch (e) {
+      console.error('Could not fetch payment details for the receipt:', e)
+    }
     const result = await applySubscriptionPayment(sub, rpPayment || { id: razorpay_payment_id }, String(decoded.userId))
-    res.json({ success: true, plan: planKey, receiptId: result?.payment?.id ?? null, razorpayPaymentId: razorpay_payment_id })
+    res.json({
+      success: true,
+      plan: planKey,
+      receiptId: result?.payment?.id ?? null,
+      razorpayPaymentId: razorpay_payment_id,
+    })
   } catch (err) {
     console.error('🔴 Verify payment error:', err)
     res.status(500).json({ error: 'Could not verify payment' })
@@ -848,7 +967,11 @@ app.post('/api/create-custom-order', async (req, res) => {
     return res.status(400).json({ error: `The minimum top-up is ${money(limits.min, selectedCurrency)}.` })
   }
   if (amountNum > limits.max) {
-    return res.status(400).json({ error: `The maximum single top-up is ${money(limits.max, selectedCurrency)}. For larger amounts, contact us.` })
+    return res
+      .status(400)
+      .json({
+        error: `The maximum single top-up is ${money(limits.max, selectedCurrency)}. For larger amounts, contact us.`,
+      })
   }
   const creditsToGrant = creditsForAmount(amountNum, selectedCurrency)
   try {
@@ -857,9 +980,15 @@ app.post('/api/create-custom-order', async (req, res) => {
       currency: selectedCurrency,
       receipt: `custom_${Date.now()}`,
       payment_capture: true, // auto-capture so funds actually settle, not just authorize
-      notes: { userId: decoded.userId, type: 'custom_payment', credits: String(creditsToGrant) }
+      notes: { userId: decoded.userId, type: 'custom_payment', credits: String(creditsToGrant) },
     })
-    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, credits: creditsToGrant, key: process.env.RAZORPAY_KEY_ID })
+    res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      credits: creditsToGrant,
+      key: process.env.RAZORPAY_KEY_ID,
+    })
   } catch (err: any) {
     console.error('Razorpay create-custom-order error:', err)
     res.status(500).json({ error: 'Could not create payment order' })
@@ -878,10 +1007,7 @@ app.post('/api/verify-custom-payment', async (req, res) => {
     return res.status(400).json({ error: 'Missing payment fields' })
   }
   const body = razorpay_order_id + '|' + razorpay_payment_id
-  const expectedSignature = crypto
-    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
-    .update(body)
-    .digest('hex')
+  const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!).update(body).digest('hex')
   if (expectedSignature !== razorpay_signature) {
     return res.status(400).json({ success: false, error: 'Payment verification failed' })
   }
@@ -913,7 +1039,7 @@ app.post('/api/verify-custom-payment', async (req, res) => {
       customCreditsINR: r.user?.customCreditsINR || 0,
       customCreditsUSD: r.user?.customCreditsUSD || 0,
       receiptId: r.payment?.id ?? null,
-      razorpayPaymentId: razorpay_payment_id
+      razorpayPaymentId: razorpay_payment_id,
     })
   } catch (err) {
     console.error('Custom payment processing failed:', err)
@@ -935,22 +1061,38 @@ app.post('/api/ai-usage', async (req, res) => {
   const today = new Date().toISOString().slice(0, 10)
   // A finished trial no longer carries the trial allowance, even if this person stayed logged in past day 14.
   const trialOver = user.plan === 'trial' && !!user.planExpiresAt && user.planExpiresAt < new Date()
-  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : (trialOver ? 'none' : user.plan)] || 0
+  const limit = AI_LIMITS[isAdminEmail(caller.email) ? 'enterprise' : trialOver ? 'none' : user.plan] || 0
 
   // 1) The plan's daily allowance (atomic, so two simultaneous requests cannot both take the last slot)
   if (limit > 0) {
-    let r: any = await User.updateOne({ _id: user._id, aiUsageDate: { $ne: today } }, { $set: { aiUsageDate: today, aiUsageToday: 1 } })
+    let r: any = await User.updateOne(
+      { _id: user._id, aiUsageDate: { $ne: today } },
+      { $set: { aiUsageDate: today, aiUsageToday: 1 } }
+    )
     if (!r.modifiedCount) {
-      r = await User.updateOne({ _id: user._id, aiUsageDate: today, aiUsageToday: { $lt: limit } }, { $inc: { aiUsageToday: 1 } })
+      r = await User.updateOne(
+        { _id: user._id, aiUsageDate: today, aiUsageToday: { $lt: limit } },
+        { $inc: { aiUsageToday: 1 } }
+      )
     }
     if (r.modifiedCount) {
       const fresh: any = await User.findById(user._id)
-      return res.json({ allowed: true, source: 'plan', usageToday: fresh?.aiUsageToday ?? 1, limit, credits: fresh?.credits || 0 })
+      return res.json({
+        allowed: true,
+        source: 'plan',
+        usageToday: fresh?.aiUsageToday ?? 1,
+        limit,
+        credits: fresh?.credits || 0,
+      })
     }
   }
 
   // 2) Purchased credits (atomic: only succeeds while at least 1 credit is left)
-  const spent: any = await User.findOneAndUpdate({ _id: user._id, credits: { $gte: 1 } }, { $inc: { credits: -1 } }, { new: true })
+  const spent: any = await User.findOneAndUpdate(
+    { _id: user._id, credits: { $gte: 1 } },
+    { $inc: { credits: -1 } },
+    { new: true }
+  )
   if (spent) {
     await logCredit(String(user._id), -1, 'ai', spent.credits || 0, String(decoded.userId))
     return res.json({ allowed: true, source: 'credits', limit, credits: spent.credits || 0 })
@@ -958,9 +1100,21 @@ app.post('/api/ai-usage', async (req, res) => {
 
   // 3) Nothing left
   if (!limit) {
-    return res.status(403).json({ error: 'no_plan', message: 'AI needs a plan or credits. Buy credits to pay only for what you use, no subscription needed.', credits: 0 })
+    return res
+      .status(403)
+      .json({
+        error: 'no_plan',
+        message: 'AI needs a plan or credits. Buy credits to pay only for what you use, no subscription needed.',
+        credits: 0,
+      })
   }
-  return res.status(429).json({ error: 'limit_reached', message: `You have used today's ${limit} AI actions. Buy credits to keep going now, or upgrade your plan.`, credits: 0 })
+  return res
+    .status(429)
+    .json({
+      error: 'limit_reached',
+      message: `You have used today's ${limit} AI actions. Buy credits to keep going now, or upgrade your plan.`,
+      credits: 0,
+    })
 })
 
 // ── Credit prices (public: the Pricing page shows a live "you get N credits" preview) ──
@@ -972,14 +1126,20 @@ app.get('/api/credit-rates', (_req, res) => {
 app.get('/api/payments', async (req, res) => {
   const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const rows: any[] = await Payment.find({ userId: String(decoded.userId) }).sort({ createdAt: -1 }).limit(200).lean()
+  const rows: any[] = await Payment.find({ userId: String(decoded.userId) })
+    .sort({ createdAt: -1 })
+    .limit(200)
+    .lean()
   res.json(rows.map(publicPayment))
 })
 
 app.get('/api/payments/by-razorpay/:paymentId', async (req, res) => {
   const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
-  const row: any = await Payment.findOne({ razorpayPaymentId: String(req.params.paymentId), userId: String(decoded.userId) })
+  const row: any = await Payment.findOne({
+    razorpayPaymentId: String(req.params.paymentId),
+    userId: String(decoded.userId),
+  })
   if (!row) return res.status(404).json({ error: 'Receipt not found yet' })
   res.json(publicPayment(row))
 })
@@ -988,7 +1148,11 @@ app.get('/api/payments/:id', async (req, res) => {
   const decoded = await authenticate(req)
   if (!decoded) return res.status(401).json({ error: 'Unauthorized' })
   let row: any = null
-  try { row = await Payment.findOne({ _id: String(req.params.id), userId: String(decoded.userId) }) } catch { row = null }
+  try {
+    row = await Payment.findOne({ _id: String(req.params.id), userId: String(decoded.userId) })
+  } catch {
+    row = null
+  }
   if (!row) return res.status(404).json({ error: 'Receipt not found' })
   res.json(publicPayment(row))
 })

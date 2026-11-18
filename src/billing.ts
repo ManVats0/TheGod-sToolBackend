@@ -1,3 +1,5 @@
+// Billing helpers: credit prices and top-up limits, money formatting, receipt HTML and email, and the public shape of a payment.
+
 import { Payment, Counter, CreditLedger } from './Payment'
 
 export type Currency = 'INR' | 'USD'
@@ -24,7 +26,10 @@ export function creditsForAmount(amount: number, c: Currency): number {
   return Math.max(0, Math.floor(a / creditPrice(c) + 1e-9))
 }
 export function creditRates() {
-  return { INR: { perCredit: creditPrice('INR'), ...creditLimits('INR') }, USD: { perCredit: creditPrice('USD'), ...creditLimits('USD') } }
+  return {
+    INR: { perCredit: creditPrice('INR'), ...creditLimits('INR') },
+    USD: { perCredit: creditPrice('USD'), ...creditLimits('USD') },
+  }
 }
 
 // ── Seller details printed on receipts / invoices (set in Railway variables) ──
@@ -34,19 +39,31 @@ export function business() {
     address: process.env.BUSINESS_ADDRESS || '',
     gstin: process.env.BUSINESS_GSTIN || '',
     gstRate: Number(process.env.GST_RATE) || 0,
-    supportEmail: process.env.SUPPORT_EMAIL || 'support@thegodstool.com'
+    supportEmail: process.env.SUPPORT_EMAIL || 'support@thegodstool.com',
   }
 }
 
 export const money = (amount: number, c: Currency) =>
-  (c === 'USD' ? '$' : '\u20B9') + Number(amount || 0).toLocaleString(c === 'USD' ? 'en-US' : 'en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  (c === 'USD' ? '$' : '\u20B9') +
+  Number(amount || 0).toLocaleString(c === 'USD' ? 'en-US' : 'en-IN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
 
-const esc = (s: any) => String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string))
+const esc = (s: any) =>
+  String(s ?? '').replace(
+    /[&<>"']/g,
+    ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch] as string
+  )
 
 // ── Receipt numbers: TGT-2026-000001 (sequential per year) ────────────────────
 export async function nextReceiptNo(date = new Date()): Promise<string> {
   const year = date.getFullYear()
-  const c: any = await Counter.findOneAndUpdate({ _id: `receipt-${year}` }, { $inc: { seq: 1 } }, { new: true, upsert: true })
+  const c: any = await Counter.findOneAndUpdate(
+    { _id: `receipt-${year}` },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  )
   return `TGT-${year}-${String(c.seq).padStart(6, '0')}`
 }
 
@@ -85,8 +102,18 @@ export async function recordPayment(p: PaymentInput): Promise<{ payment: any; cr
   }
 }
 
-export async function logCredit(userId: string, delta: number, reason: string, balanceAfter: number | null, ref?: string | null) {
-  try { await CreditLedger.create({ userId, delta, reason, balanceAfter, ref: ref || null }) } catch (e) { console.error('Credit ledger write failed:', e) }
+export async function logCredit(
+  userId: string,
+  delta: number,
+  reason: string,
+  balanceAfter: number | null,
+  ref?: string | null
+) {
+  try {
+    await CreditLedger.create({ userId, delta, reason, balanceAfter, ref: ref || null })
+  } catch (e) {
+    console.error('Credit ledger write failed:', e)
+  }
 }
 
 export function describePayment(p: any): string {
@@ -114,7 +141,7 @@ export function publicPayment(p: any) {
     customerName: p.customerName || null,
     emailed: !!p.emailSent,
     createdAt: p.createdAt,
-    business: business()
+    business: business(),
   }
 }
 
@@ -122,14 +149,22 @@ export function receiptHtml(p: any): string {
   const b = business()
   const gst = b.gstRate > 0 ? p.amount - p.amount / (1 + b.gstRate / 100) : 0
   const title = b.gstin ? 'Tax invoice' : 'Payment receipt'
-  const when = new Date(p.createdAt || Date.now()).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
-  const row = (k: string, v: string) => `<tr><td style="padding:6px 0;color:#64748b;">${k}</td><td style="padding:6px 0;text-align:right;color:#0f172a;font-weight:600;">${v}</td></tr>`
+  const when = new Date(p.createdAt || Date.now()).toLocaleDateString('en-IN', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  })
+  const row = (k: string, v: string) =>
+    `<tr><td style="padding:6px 0;color:#64748b;">${k}</td><td style="padding:6px 0;text-align:right;color:#0f172a;font-weight:600;">${v}</td></tr>`
   const extra =
     p.kind === 'credits'
       ? row('Credits added', `+${Number(p.credits || 0).toLocaleString('en-IN')}`) +
         (p.balanceAfter != null ? row('New credit balance', Number(p.balanceAfter).toLocaleString('en-IN')) : '')
       : p.periodEnd
-        ? row('Access paid until', new Date(p.periodEnd).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }))
+        ? row(
+            'Access paid until',
+            new Date(p.periodEnd).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
+          )
         : ''
   return `
   <div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:520px;margin:24px auto;padding:28px;border:1px solid #e2e8f0;border-radius:14px;background:#ffffff;color:#0f172a;">
@@ -159,7 +194,7 @@ export async function sendReceiptEmail(p: any): Promise<boolean> {
       from: 'The Gods Tool <noreply@thegodstool.com>',
       to: p.customerEmail,
       subject: `Your receipt ${p.receiptNo} \u2013 ${business().name}`,
-      html: receiptHtml(p)
+      html: receiptHtml(p),
     })
     await Payment.updateOne({ _id: p._id }, { $set: { emailSent: true } })
     return true
